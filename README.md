@@ -6,22 +6,27 @@ Path-scoped rule loading for Codex.
 
 It exists for repos that already keep Claude-style path rules and do not want to load every rule into every Codex session.
 
+## Requirements
+
+- A Codex CLI recent enough to honor `hookSpecificOutput.additionalContext` on `PreToolUse` ([openai/codex#20692](https://github.com/openai/codex/pull/20692), May 2026). Older releases reject the hook output as unsupported and inject nothing.
+- Hooks enabled. Recent Codex releases enable the `hooks` feature by default; older ones need `[features] hooks = true`.
+
 ## Install
 
 ```sh
-cargo install --git https://github.com/bengous/codex-path-rules
+cargo install --locked --git https://github.com/bengous/codex-path-rules
 ```
 
 ## Configure Codex
 
-Add a hook to `.codex/config.toml` in your repo:
+Add hooks to `.codex/config.toml` in your repo:
 
 ```toml
 [features]
 hooks = true
 
 [[hooks.PreToolUse]]
-matcher = "^(Bash|apply_patch|Edit|Write)$"
+matcher = "^(Bash|apply_patch|Edit|Write|MultiEdit)$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
@@ -29,8 +34,10 @@ command = "codex-path-rules"
 timeout = 10
 statusMessage = "Loading path rules"
 
+# `resume` is deliberately excluded: a resumed session keeps its context, so
+# rules already injected must stay de-duplicated.
 [[hooks.SessionStart]]
-matcher = "compact|clear"
+matcher = "startup|clear"
 
 [[hooks.SessionStart.hooks]]
 type = "command"
@@ -38,6 +45,15 @@ command = "codex-path-rules"
 timeout = 10
 statusMessage = "Resetting path rules"
 
+[[hooks.SessionEnd]]
+
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "codex-path-rules"
+timeout = 10
+statusMessage = "Cleaning path rules state"
+
+# Compaction rewrites the context, so previously injected rules may be gone.
 [[hooks.PostCompact]]
 matcher = "manual|auto"
 
@@ -78,18 +94,24 @@ Keep component styles in the matching stylesheet.
 
 ## Behavior
 
-- Reads Markdown rules recursively under `.claude/rules/`.
-- Supports `paths:` as a scalar, block list, or inline list.
-- Supports glob `*`, `**`, `?`, and `{a,b}` brace alternation.
-- Injects each rule once per session.
-- Resets session cache on `SessionStart` and `PostCompact`.
+- Reads Markdown rules recursively under `.claude/rules/`; symlinked rule files are ignored.
+- Supports `paths:` as a scalar, block list, or inline list; globs support `*`, `**`, `?`, and `{a,b}` brace alternation.
+- Injects each rule once per session; resets on `SessionStart` (startup/clear), `SessionEnd`, and `PostCompact`.
+- Budgets injection at 6000 characters per rule and 12000 per batch. A rule that does not fit the current batch is deferred: it stays eligible and is injected by the next matching tool call, never silently lost.
+- Rule bodies reach the model verbatim, except literal `</rule>` sequences, which are neutralized so a rule cannot break out of its wrapper block.
 - Fails open: hook errors are printed to stderr and never block the tool call.
-- Ignores symlinked rule files.
-- Caches state under `~/.cache/codex-path-rules/`, or `CODEX_PATH_RULES_CACHE` when set.
+- Caches state under `~/.cache/codex-path-rules/` (respects `XDG_CACHE_HOME`; override with `CODEX_PATH_RULES_CACHE`). Session state idle for 7 days is swept on reset events, and lock directories leaked by a killed hook are broken after 60 seconds.
 
 For `Bash`, path detection is intentionally lightweight. It recognizes common read commands such as `cat`, `nl`, `less`, `more`, `sed`, `head`, `tail`, `rg`, and `grep`. For edits, it reads path fields and patch headers from `apply_patch`, `Edit`, `Write`, and `MultiEdit` payloads.
 
+## Known limitations
+
+- Some Codex releases do not fire `PreToolUse` for `apply_patch` or MCP tools ([openai/codex#16732](https://github.com/openai/codex/issues/16732)); affected rules then inject on the next matching `Bash` call instead.
+- Bash path extraction is a best-effort lexer, not a full shell parser: redirections, subshells, and unrecognized commands contribute no paths.
+
 ## Development
+
+The crate is a small library (`src/lib.rs`, one module per concern — see the crate docs for the module map) plus a thin CLI (`src/main.rs`).
 
 ```sh
 cargo fmt --check
