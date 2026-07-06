@@ -60,6 +60,10 @@ fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookRes
 
     if let Some(extra_dirs) = extra_dirs {
         for dir in env::split_paths(extra_dirs) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+
             let rules_dir = if dir.is_absolute() {
                 clean_path(dir)
             } else {
@@ -499,6 +503,20 @@ mod tests {
         .expect("write rule");
     }
 
+    fn join_path_components(components: &[&OsStr]) -> std::ffi::OsString {
+        let mut joined = std::ffi::OsString::new();
+        let separator = if cfg!(windows) { ";" } else { ":" };
+
+        for (index, component) in components.iter().enumerate() {
+            if index > 0 {
+                joined.push(separator);
+            }
+            joined.push(component);
+        }
+
+        joined
+    }
+
     #[test]
     fn rule_matches_when_a_glob_matches() {
         let rule = rule_with(Some(vec!["src/**/*.css".to_owned()]));
@@ -558,6 +576,42 @@ mod tests {
 
         let rules = scan_rules_with_extra_dirs(&repo, Some(OsStr::new("shared-rules")))
             .expect("scan rules");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].content, "SHARED");
+    }
+
+    #[test]
+    fn scan_rules_skips_empty_extra_rule_dirs() {
+        let root = create_temp_dir("rules-extra-empty").expect("temp dir");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(repo.join("README.md"), "ROOT").expect("write readme");
+
+        let rules = scan_rules_with_extra_dirs(&repo, Some(OsStr::new(""))).expect("scan rules");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn scan_rules_skips_empty_entries_between_extra_rule_dirs() {
+        let root = create_temp_dir("rules-extra-empty-components").expect("temp dir");
+        let repo = root.join("repo");
+        let extra = root.join("shared-rules");
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(repo.join("README.md"), "ROOT").expect("write readme");
+        write_rule(&extra, "shared.md", "SHARED");
+
+        let joined = join_path_components(&[
+            OsStr::new(""),
+            extra.as_os_str(),
+            OsStr::new(""),
+            OsStr::new(""),
+        ]);
+        let rules =
+            scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(rules.len(), 1);
