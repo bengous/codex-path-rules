@@ -1,12 +1,15 @@
 //! Rule discovery under `.claude/rules`, front matter parsing, and matching of
 //! touched paths against a rule's globs.
 
+use std::collections::HashSet;
+use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::HookResult;
 use crate::glob::{glob_matches, split_top_level_commas};
-use crate::pathutil::{path_to_posix, path_to_string, resolve_path, strip_dot_slash};
+use crate::pathutil::{clean_path, path_to_posix, path_to_string, resolve_path, strip_dot_slash};
 
 /// Directory, relative to the working directory, scanned for `*.md` rule files.
 const RULES_DIR: &str = ".claude/rules";
@@ -40,12 +43,51 @@ struct ParsedRule {
 /// Returns an error if the directory tree cannot be traversed or a rule file
 /// cannot be read.
 pub(crate) fn scan_rules(cwd: &Path) -> HookResult<Vec<Rule>> {
+    let extra_dirs = env::var_os("CODEX_PATH_RULES_EXTRA_DIRS");
+    scan_rules_with_extra_dirs(cwd, extra_dirs.as_deref())
+}
+
+/// Discover project-local rules plus any explicitly configured extra rule
+/// directories. Project-local rules are always loaded first; extra directories
+/// are loaded in the order provided by the caller. Repeated directories are
+/// de-duplicated by absolute rule path so a rule is never injected twice.
+fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookResult<Vec<Rule>> {
     let rules_dir = resolve_path(cwd, RULES_DIR);
+    let mut rules = Vec::new();
+    let mut seen = HashSet::new();
+
+    append_new_rules(&mut rules, &mut seen, scan_rules_dir(&rules_dir)?);
+
+    if let Some(extra_dirs) = extra_dirs {
+        for dir in env::split_paths(extra_dirs) {
+            let rules_dir = if dir.is_absolute() {
+                clean_path(dir)
+            } else {
+                clean_path(cwd.join(dir))
+            };
+            append_new_rules(&mut rules, &mut seen, scan_rules_dir(&rules_dir)?);
+        }
+    }
+
+    Ok(rules)
+}
+
+/// Append rules whose keys have not already been seen.
+fn append_new_rules(rules: &mut Vec<Rule>, seen: &mut HashSet<String>, new_rules: Vec<Rule>) {
+    for rule in new_rules {
+        if seen.insert(rule.key.clone()) {
+            rules.push(rule);
+        }
+    }
+}
+
+/// Discover and parse every rule under one rule directory.
+fn scan_rules_dir(rules_dir: &Path) -> HookResult<Vec<Rule>> {
     if !rules_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut files = find_markdown_files(&rules_dir)?;
+    let mut files = find_markdown_files(rules_dir)?;
     files.sort();
 
     let mut rules = Vec::new();
@@ -297,6 +339,7 @@ fn normalize_trigger_path(input_path: &str, cwd: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selftest::create_temp_dir;
 
     // parse_paths ------------------------------------------------------------
 
@@ -447,6 +490,15 @@ mod tests {
         }
     }
 
+    fn write_rule(dir: &Path, name: &str, marker: &str) {
+        fs::create_dir_all(dir).expect("create rules dir");
+        fs::write(
+            dir.join(name),
+            format!("---\npaths:\n  - \"src/**\"\n---\n\n{marker}"),
+        )
+        .expect("write rule");
+    }
+
     #[test]
     fn rule_matches_when_a_glob_matches() {
         let rule = rule_with(Some(vec!["src/**/*.css".to_owned()]));
@@ -473,6 +525,59 @@ mod tests {
     fn rule_never_matches_a_path_outside_cwd() {
         let rule = rule_with(None);
         assert!(!rule_matches(&rule, "/outside/x", Path::new("/repo")));
+    }
+
+    // scan_rules_with_extra_dirs -------------------------------------------
+
+    #[test]
+    fn scan_rules_reads_extra_rule_dirs_after_project_rules() {
+        let root = create_temp_dir("rules-extra").expect("temp dir");
+        let repo = root.join("repo");
+        let extra = root.join("shared-rules");
+        write_rule(&repo.join(".claude").join("rules"), "project.md", "PROJECT");
+        write_rule(&extra, "shared.md", "SHARED");
+
+        let joined = env::join_paths([&extra]).expect("join paths");
+        let rules =
+            scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
+        let markers = rules
+            .iter()
+            .map(|rule| rule.content.as_str())
+            .collect::<Vec<_>>();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(markers, ["PROJECT", "SHARED"]);
+    }
+
+    #[test]
+    fn scan_rules_resolves_relative_extra_rule_dirs_against_cwd() {
+        let root = create_temp_dir("rules-extra-relative").expect("temp dir");
+        let repo = root.join("repo");
+        let extra = repo.join("shared-rules");
+        write_rule(&extra, "shared.md", "SHARED");
+
+        let rules = scan_rules_with_extra_dirs(&repo, Some(OsStr::new("shared-rules")))
+            .expect("scan rules");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].content, "SHARED");
+    }
+
+    #[test]
+    fn scan_rules_deduplicates_repeated_extra_rule_dirs() {
+        let root = create_temp_dir("rules-extra-dedup").expect("temp dir");
+        let repo = root.join("repo");
+        let extra = root.join("shared-rules");
+        write_rule(&extra, "shared.md", "SHARED");
+
+        let joined = env::join_paths([&extra, &extra]).expect("join paths");
+        let rules =
+            scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].content, "SHARED");
     }
 
     // unquote ------------------------------------------------------------------
