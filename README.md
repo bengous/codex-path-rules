@@ -66,6 +66,28 @@ statusMessage = "Resetting path rules"
 
 Codex requires project-local hooks to be trusted before they run. Use `/hooks` in the Codex CLI when prompted.
 
+To load shared rule directories in addition to the current repo's `.claude/rules`, set `CODEX_PATH_RULES_EXTRA_DIRS` in the environment that launches Codex:
+
+```sh
+CODEX_PATH_RULES_EXTRA_DIRS="$HOME/work/agent-rules" codex
+```
+
+Multiple directories use the platform path separator:
+
+```sh
+CODEX_PATH_RULES_EXTRA_DIRS="$HOME/work/agent-rules:$HOME/.claude/rules" codex
+```
+
+You can also pin the variable on the hook command itself:
+
+```toml
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "CODEX_PATH_RULES_EXTRA_DIRS=$HOME/work/agent-rules codex-path-rules"
+timeout = 10
+statusMessage = "Loading path rules"
+```
+
 ## Rule Files
 
 Create Markdown files under `.claude/rules/`:
@@ -95,6 +117,7 @@ Keep component styles in the matching stylesheet.
 ## Behavior
 
 - Reads Markdown rules recursively under `.claude/rules/`; symlinked rule files are ignored.
+- Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`; repeated rule paths are de-duplicated.
 - Supports `paths:` as a scalar, block list, or inline list; globs support `*`, `**`, `?`, and `{a,b}` brace alternation.
 - Injects each rule once per session; resets on `SessionStart` (startup/clear), `SessionEnd`, and `PostCompact`.
 - Budgets injection at 6000 characters per rule and 12000 per batch. A rule that does not fit the current batch is deferred: it stays eligible and is injected by the next matching tool call, never silently lost.
