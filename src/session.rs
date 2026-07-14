@@ -28,10 +28,12 @@ const STALE_LOCK_AGE: Duration = Duration::from_secs(60);
 /// after this long merely has its rules injected once more.
 pub(crate) const STALE_STATE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Per-session record of which rules have already been injected.
+/// Per-session record of which rules have already been injected or warned
+/// about.
 #[derive(Debug, Default)]
 pub(crate) struct HookState {
     pub(crate) injected_rules: Vec<String>,
+    pub(crate) warned_rules: Vec<String>,
 }
 
 /// Directory-backed lock guarding one session cache file.
@@ -226,8 +228,19 @@ pub(crate) fn read_state(
         )
     })?;
 
-    let injected_rules = parsed
-        .get("injectedRules")
+    let injected_rules = read_string_array(&parsed, "injectedRules");
+    let warned_rules = read_string_array(&parsed, "warnedRules");
+
+    Ok(HookState {
+        injected_rules,
+        warned_rules,
+    })
+}
+
+/// Read one optional array of strings from the cache state.
+fn read_string_array(parsed: &Value, field: &str) -> Vec<String> {
+    parsed
+        .get(field)
         .and_then(Value::as_array)
         .map(|values| {
             values
@@ -236,9 +249,7 @@ pub(crate) fn read_state(
                 .map(ToOwned::to_owned)
                 .collect()
         })
-        .unwrap_or_default();
-
-    Ok(HookState { injected_rules })
+        .unwrap_or_default()
 }
 
 /// Persist the per-session state, creating the cache directory if needed.
@@ -259,7 +270,10 @@ pub(crate) fn write_state(
             .map_err(|error| format!("failed to create cache directory: {error}"))?;
     }
 
-    let output = json!({ "injectedRules": state.injected_rules });
+    let output = json!({
+        "injectedRules": state.injected_rules,
+        "warnedRules": state.warned_rules,
+    });
     let temporary = file.with_extension(format!("json.tmp-{}", process::id()));
     fs::write(&temporary, format!("{output}\n")).map_err(|error| {
         format!(
@@ -402,7 +416,7 @@ mod tests {
         let state =
             read_state(Path::new("/repo"), "sess", Some(&root)).expect("missing cache is ok");
         let _ = fs::remove_dir_all(&root);
-        assert!(state.injected_rules.is_empty());
+        assert!(state.injected_rules.is_empty() && state.warned_rules.is_empty());
     }
 
     #[test]
@@ -424,11 +438,34 @@ mod tests {
         let root = create_temp_dir("path-rules-test").expect("temp dir");
         let written = HookState {
             injected_rules: vec!["a".to_owned(), "b".to_owned()],
+            warned_rules: vec!["invalid".to_owned()],
         };
         write_state(Path::new("/repo"), "sess", Some(&root), &written).expect("write state");
         let loaded = read_state(Path::new("/repo"), "sess", Some(&root)).expect("read state");
         let _ = fs::remove_dir_all(&root);
-        assert_eq!(loaded.injected_rules, ["a", "b"]);
+        assert_eq!(
+            (loaded.injected_rules, loaded.warned_rules),
+            (
+                vec!["a".to_owned(), "b".to_owned()],
+                vec!["invalid".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn read_state_defaults_warned_rules_for_an_older_cache() {
+        let root = create_temp_dir("path-rules-test").expect("temp dir");
+        let file = cache_file(Path::new("/repo"), "sess", Some(&root));
+        fs::create_dir_all(file.parent().expect("cache parent")).expect("create cache dir");
+        fs::write(&file, r#"{"injectedRules":["a"]}"#).expect("write older cache");
+
+        let loaded = read_state(Path::new("/repo"), "sess", Some(&root)).expect("read state");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            (loaded.injected_rules, loaded.warned_rules),
+            (vec!["a".to_owned()], Vec::<String>::new())
+        );
     }
 
     #[test]

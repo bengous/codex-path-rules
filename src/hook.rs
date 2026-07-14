@@ -6,10 +6,10 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::HookResult;
-use crate::pathutil::{clean_path, resolve_path};
+use crate::pathutil::{clean_path, path_to_posix, resolve_path};
 use crate::payload::read_field_string;
 use crate::render::render_rules;
-use crate::rules::{rule_matches, scan_rules};
+use crate::rules::{RuleDiagnostic, rule_matches, scan_rules};
 use crate::session::{
     STALE_STATE_AGE, acquire_state_lock, read_session_id, read_state, reset_state,
     sweep_stale_sessions, write_state,
@@ -32,7 +32,8 @@ pub(crate) fn run_hook(input: &Value, fallback_cwd: &Path) -> HookResult<Option<
 /// sweeps stale cache entries, and returns `None`. On `PreToolUse` it matches
 /// the touched paths against the discovered rules and returns `Some(output)`
 /// carrying the `additionalContext` for the matching rules not yet injected
-/// this session, plus a top-level `systemMessage` for invalid rule content.
+/// this session, plus a top-level `systemMessage` once per invalid rule per
+/// session.
 /// Only the rules actually emitted are marked as injected: a rule deferred by
 /// the batch budget stays eligible for the next matching tool call. All other
 /// events, and calls with neither context nor diagnostics, return `None`
@@ -85,26 +86,45 @@ pub(crate) fn run_hook_with_cache(
                 .any(|trigger_path| rule_matches(rule, trigger_path, &cwd))
         })
         .collect::<Vec<_>>();
-    let system_message = (!scan.diagnostics.is_empty())
-        .then(|| format!("Invalid path rule(s):\n- {}", scan.diagnostics.join("\n- ")));
-    let context = if matched.is_empty() {
-        None
-    } else {
-        let _lock = acquire_state_lock(&cwd, &session_id, cache_root)?;
-        let mut state = read_state(&cwd, &session_id, cache_root)?;
-        let candidates = matched
-            .into_iter()
-            .filter(|rule| !state.injected_rules.contains(&rule.key))
+    if matched.is_empty() && scan.diagnostics.is_empty() {
+        return Ok(None);
+    }
+
+    let _lock = acquire_state_lock(&cwd, &session_id, cache_root)?;
+    let mut state = read_state(&cwd, &session_id, cache_root)?;
+    let diagnostics = scan
+        .diagnostics
+        .into_iter()
+        .filter(|diagnostic| !state.warned_rules.contains(&diagnostic.key))
+        .collect::<Vec<_>>();
+    let candidates = matched
+        .into_iter()
+        .filter(|rule| !state.injected_rules.contains(&rule.key))
+        .collect::<Vec<_>>();
+    let batch = render_rules(&candidates);
+    let emitted_context = !batch.emitted_keys.is_empty();
+    let emitted_diagnostics = !diagnostics.is_empty();
+
+    if emitted_context {
+        state.injected_rules.extend(batch.emitted_keys);
+    }
+    if emitted_diagnostics {
+        state
+            .warned_rules
+            .extend(diagnostics.iter().map(|diagnostic| diagnostic.key.clone()));
+    }
+    if emitted_context || emitted_diagnostics {
+        write_state(&cwd, &session_id, cache_root, &state)?;
+    }
+
+    let context = emitted_context.then_some(batch.context);
+    let system_message = emitted_diagnostics.then(|| {
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| format_rule_diagnostic(diagnostic, &cwd))
             .collect::<Vec<_>>();
-        let batch = render_rules(&candidates);
-        if batch.emitted_keys.is_empty() {
-            None
-        } else {
-            state.injected_rules.extend(batch.emitted_keys);
-            write_state(&cwd, &session_id, cache_root, &state)?;
-            Some(batch.context)
-        }
-    };
+        format!("Invalid path rule(s):\n- {}", messages.join("\n- "))
+    });
 
     if system_message.is_none() && context.is_none() {
         return Ok(None);
@@ -121,6 +141,16 @@ pub(crate) fn run_hook_with_cache(
         });
     }
     Ok(Some(output))
+}
+
+/// Format a rule diagnostic for the human-facing `systemMessage`, using a
+/// repository-relative path when possible.
+fn format_rule_diagnostic(diagnostic: &RuleDiagnostic, cwd: &Path) -> String {
+    let path = Path::new(&diagnostic.key)
+        .strip_prefix(cwd)
+        .map(path_to_posix)
+        .unwrap_or_else(|_| diagnostic.key.clone());
+    format!("{path}: {}", diagnostic.reason)
 }
 
 #[cfg(test)]
@@ -238,7 +268,11 @@ mod tests {
             !context.contains("Invalid path rule") && !context.contains("invalid.md"),
             "diagnostic must not reach additionalContext"
         );
-        assert!(system_message.contains("invalid.md"));
+        assert!(
+            system_message.contains(".claude/rules/invalid.md")
+                && !system_message.contains(&path_to_string(&repo)),
+            "project rule path should be relative: {system_message}"
+        );
         assert!(system_message.contains("`paths:` must contain at least one glob"));
     }
 
@@ -255,5 +289,55 @@ mod tests {
             output.get("hookSpecificOutput").is_none(),
             "diagnostic-only output must not add agent context"
         );
+    }
+
+    #[test]
+    fn an_invalid_rule_warning_is_emitted_once_per_session() {
+        let (root, repo, cache) = temp_repo();
+        write_rule(&repo, "invalid.md", "---\npaths: []\n---\nINVALID");
+
+        let first = edit_src_app(&repo, &cache).expect("first diagnostic output");
+        let second = edit_src_app(&repo, &cache);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(first["systemMessage"].as_str().is_some() && second.is_none());
+    }
+
+    #[test]
+    fn a_session_reset_allows_an_invalid_rule_warning_again() {
+        let (root, repo, cache) = temp_repo();
+        write_rule(&repo, "invalid.md", "---\npaths: []\n---\nINVALID");
+        edit_src_app(&repo, &cache).expect("first diagnostic output");
+        run_hook_with_cache(
+            &json!({
+                "hook_event_name": "PostCompact",
+                "session_id": "test-session",
+                "cwd": path_to_string(&repo),
+            }),
+            &repo,
+            Some(&cache),
+        )
+        .expect("reset should succeed");
+
+        let output = edit_src_app(&repo, &cache).expect("diagnostic after reset");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(output["systemMessage"].as_str().is_some());
+    }
+
+    #[test]
+    fn an_external_rule_diagnostic_keeps_its_absolute_path() {
+        let root = create_temp_dir("hook-diagnostic-path").expect("temp dir");
+        let cwd = root.join("repo");
+        let external = root.join("shared-rules").join("invalid.md");
+        let diagnostic = RuleDiagnostic {
+            key: path_to_string(&external),
+            reason: "invalid",
+        };
+
+        let message = format_rule_diagnostic(&diagnostic, &cwd);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(message, format!("{}: invalid", path_to_string(&external)));
     }
 }

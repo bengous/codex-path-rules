@@ -121,6 +121,8 @@ Keep component styles in the matching stylesheet.
 - Reads Markdown rules recursively under `.claude/rules/`; symlinked rule files are ignored.
 - Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`; repeated rule paths and aliases are de-duplicated.
 - Supports `paths:` as a scalar, block list, or inline list; globs support `*`, `**`, `?`, and `{a,b}` brace alternation.
+- Rules without front matter apply globally. A leading `---` opens front matter and must have a closing fence.
+- Skips malformed rules and empty `paths:` values without blocking the tool call. Codex shows each invalid-rule warning once per session through `systemMessage`; warnings are never added to agent context.
 - Injects each rule once per session; resets on `SessionStart` (startup/clear), `SessionEnd`, and `PostCompact`.
 - Budgets injection at 6000 characters per rule and 12000 per batch. A rule that does not fit the current batch is deferred: it stays eligible and is injected by the next matching tool call, never silently lost.
 - Rule bodies reach the model verbatim, except literal `</rule>` sequences, which are neutralized so a rule cannot break out of its wrapper block.
