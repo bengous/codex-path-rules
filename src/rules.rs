@@ -32,7 +32,15 @@ pub(crate) struct Rule {
 #[derive(Debug)]
 pub(crate) struct RuleScan {
     pub(crate) rules: Vec<Rule>,
-    pub(crate) diagnostics: Vec<String>,
+    pub(crate) diagnostics: Vec<RuleDiagnostic>,
+}
+
+/// One invalid rule, identified by canonical path for per-session warning
+/// de-duplication.
+#[derive(Debug)]
+pub(crate) struct RuleDiagnostic {
+    pub(crate) key: String,
+    pub(crate) reason: &'static str,
 }
 
 /// Outcome of parsing a rule file's optional front matter.
@@ -120,7 +128,7 @@ fn scan_rules_dir(
         let parsed = match parse_rule_markdown(&markdown) {
             Ok(parsed) => parsed,
             Err(reason) => {
-                scan.diagnostics.push(format!("{key}: {reason}"));
+                scan.diagnostics.push(RuleDiagnostic { key, reason });
                 continue;
             }
         };
@@ -256,13 +264,14 @@ fn parse_paths(frontmatter: &str) -> Result<Option<Vec<String>>, &'static str> {
         let Some(rest) = line.trim().strip_prefix("paths:") else {
             continue;
         };
+        let rest = rest.trim();
 
-        let paths = if rest.trim().is_empty() {
+        let paths = if rest.is_empty() {
             parse_block_list(lines)?
-        } else if rest.trim().starts_with('[') {
-            parse_flow_list(rest.trim())?
+        } else if rest.starts_with('[') {
+            parse_flow_list(rest)?
         } else {
-            let value = unquote(rest.trim())?;
+            let value = unquote(rest)?;
             if value.is_empty() {
                 Vec::new()
             } else {
@@ -285,7 +294,7 @@ fn parse_block_list<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Vec<Stri
     let mut paths = Vec::new();
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let Some(item) = trimmed.strip_prefix('-') else {
@@ -410,6 +419,14 @@ mod tests {
     #[test]
     fn parse_paths_stops_at_first_non_list_line() {
         assert_eq!(parsed_paths("paths:\n  - a\nother: x\n  - b\n"), ["a"]);
+    }
+
+    #[test]
+    fn parse_paths_skips_comments_between_block_list_items() {
+        assert_eq!(
+            parsed_paths("paths:\n  # first group\n  - a\n  # second group\n  - b\n"),
+            ["a", "b"]
+        );
     }
 
     #[test]
