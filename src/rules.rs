@@ -17,7 +17,7 @@ const RULES_DIR: &str = ".claude/rules";
 /// A rule discovered under [`RULES_DIR`], ready to be matched and injected.
 #[derive(Debug, Clone)]
 pub(crate) struct Rule {
-    /// Stable identity (the rule's absolute path) used to inject it at most
+    /// Stable identity (the rule's canonical path) used to inject it at most
     /// once per session.
     pub(crate) key: String,
     /// Glob patterns from the `paths:` front matter; `None` means the rule
@@ -50,7 +50,7 @@ pub(crate) fn scan_rules(cwd: &Path) -> HookResult<Vec<Rule>> {
 /// Discover project-local rules plus any explicitly configured extra rule
 /// directories. Project-local rules are always loaded first; extra directories
 /// are loaded in the order provided by the caller. Repeated directories are
-/// de-duplicated by absolute rule path so a rule is never injected twice.
+/// de-duplicated by canonical rule path so aliases cannot inject a rule twice.
 fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookResult<Vec<Rule>> {
     let rules_dir = resolve_path(cwd, RULES_DIR);
     let mut rules = Vec::new();
@@ -96,6 +96,12 @@ fn scan_rules_dir(rules_dir: &Path) -> HookResult<Vec<Rule>> {
 
     let mut rules = Vec::new();
     for absolute_path in files {
+        let canonical_path = fs::canonicalize(&absolute_path).map_err(|error| {
+            format!(
+                "failed to canonicalize rule {}: {error}",
+                path_to_string(&absolute_path)
+            )
+        })?;
         let markdown = fs::read_to_string(&absolute_path).map_err(|error| {
             format!(
                 "failed to read rule {}: {error}",
@@ -108,7 +114,7 @@ fn scan_rules_dir(rules_dir: &Path) -> HookResult<Vec<Rule>> {
         }
 
         rules.push(Rule {
-            key: path_to_string(&absolute_path),
+            key: path_to_string(&canonical_path),
             paths: parsed.paths,
             content: parsed.content,
         });
@@ -626,6 +632,27 @@ mod tests {
         write_rule(&extra, "shared.md", "SHARED");
 
         let joined = env::join_paths([&extra, &extra]).expect("join paths");
+        let rules =
+            scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].content, "SHARED");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_rules_deduplicates_symlinked_extra_rule_dir_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let root = create_temp_dir("rules-extra-symlink-dedup").expect("temp dir");
+        let repo = root.join("repo");
+        let extra = root.join("shared-rules");
+        let alias = root.join("shared-rules-alias");
+        write_rule(&extra, "shared.md", "SHARED");
+        symlink(&extra, &alias).expect("symlink rules dir");
+
+        let joined = env::join_paths([&extra, &alias]).expect("join paths");
         let rules =
             scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
         let _ = fs::remove_dir_all(&root);
