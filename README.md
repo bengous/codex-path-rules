@@ -131,10 +131,11 @@ For `Bash`, path detection is intentionally lightweight. It recognizes common re
 
 ## Known limitations
 
-- Some Codex releases do not fire `PreToolUse` for `apply_patch` or MCP tools ([openai/codex#16732](https://github.com/openai/codex/issues/16732)); affected rules then inject on the next matching `Bash` call instead.
-- Bash path extraction is a best-effort lexer, not a full shell parser: redirections, subshells, and unrecognized commands contribute no paths.
-- Git detection does not infer paths from refs, options, `REV:path`, commands without a literal `--`, unsupported subcommands, or invocations with global Git options.
-- Find detection requires at least one explicit root, does not support global options, and stops collecting roots at the first token beginning with `-`, `(`, or `!`.
+- The reference matcher excludes MCP tools because their names and input schemas vary by server. To cover one, add its tool name to the matcher; path extraction can read only direct `path`, `file_path`, or `filePath` fields from an otherwise unrecognized tool input.
+- Bash path extraction is a best-effort lexer, not a full shell parser. Only the commands listed above have dedicated handling; redirections and subshells may be missed or misclassified.
+- Git detection handles only direct `git diff`, `git show`, `git log`, and `git blame` commands with a literal `--`. Global Git options, other subcommands, paths before `--`, and `REV:path` are ignored.
+- Find detection reads explicit roots until the first predicate or operator. It does not infer the default `.` root or handle global options.
+- Each directory operand expands to the directory itself and at most 200 files beneath it. `.git`, `node_modules`, `dist`, and unreadable directories are skipped.
 
 ## Development
 
