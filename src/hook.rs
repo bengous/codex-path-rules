@@ -32,9 +32,10 @@ pub(crate) fn run_hook(input: &Value, fallback_cwd: &Path) -> HookResult<Option<
 /// sweeps stale cache entries, and returns `None`. On `PreToolUse` it matches
 /// the touched paths against the discovered rules and returns `Some(output)`
 /// carrying the `additionalContext` for the matching rules not yet injected
-/// this session. Only the rules actually emitted are marked as injected: a
-/// rule deferred by the batch budget stays eligible for the next matching tool
-/// call. All other events, and calls with nothing to inject, return `None`
+/// this session, plus a top-level `systemMessage` for invalid rule content.
+/// Only the rules actually emitted are marked as injected: a rule deferred by
+/// the batch budget stays eligible for the next matching tool call. All other
+/// events, and calls with neither context nor diagnostics, return `None`
 /// without touching the state file.
 ///
 /// `cache_root` overrides the state location (used by tests); production passes
@@ -74,7 +75,9 @@ pub(crate) fn run_hook_with_cache(
         return Ok(None);
     }
 
-    let matched = scan_rules(&cwd)?
+    let scan = scan_rules(&cwd)?;
+    let matched = scan
+        .rules
         .into_iter()
         .filter(|rule| {
             touched_paths
@@ -82,34 +85,42 @@ pub(crate) fn run_hook_with_cache(
                 .any(|trigger_path| rule_matches(rule, trigger_path, &cwd))
         })
         .collect::<Vec<_>>();
-    if matched.is_empty() {
-        return Ok(None);
-    }
-
-    let _lock = acquire_state_lock(&cwd, &session_id, cache_root)?;
-    let mut state = read_state(&cwd, &session_id, cache_root)?;
-    let candidates = matched
-        .into_iter()
-        .filter(|rule| !state.injected_rules.contains(&rule.key))
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-
-    let batch = render_rules(&candidates);
-    if batch.emitted_keys.is_empty() {
-        return Ok(None);
-    }
-
-    state.injected_rules.extend(batch.emitted_keys);
-    write_state(&cwd, &session_id, cache_root, &state)?;
-
-    Ok(Some(json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "additionalContext": batch.context,
+    let system_message = (!scan.diagnostics.is_empty())
+        .then(|| format!("Invalid path rule(s):\n- {}", scan.diagnostics.join("\n- ")));
+    let context = if matched.is_empty() {
+        None
+    } else {
+        let _lock = acquire_state_lock(&cwd, &session_id, cache_root)?;
+        let mut state = read_state(&cwd, &session_id, cache_root)?;
+        let candidates = matched
+            .into_iter()
+            .filter(|rule| !state.injected_rules.contains(&rule.key))
+            .collect::<Vec<_>>();
+        let batch = render_rules(&candidates);
+        if batch.emitted_keys.is_empty() {
+            None
+        } else {
+            state.injected_rules.extend(batch.emitted_keys);
+            write_state(&cwd, &session_id, cache_root, &state)?;
+            Some(batch.context)
         }
-    })))
+    };
+
+    if system_message.is_none() && context.is_none() {
+        return Ok(None);
+    }
+
+    let mut output = json!({});
+    if let Some(system_message) = system_message {
+        output["systemMessage"] = Value::String(system_message);
+    }
+    if let Some(context) = context {
+        output["hookSpecificOutput"] = json!({
+            "hookEventName": "PreToolUse",
+            "additionalContext": context,
+        });
+    }
+    Ok(Some(output))
 }
 
 #[cfg(test)]
@@ -145,6 +156,10 @@ mod tests {
             Some(cache),
         )
         .expect("hook run should succeed")
+    }
+
+    fn write_rule(repo: &Path, name: &str, markdown: &str) {
+        fs::write(repo.join(".claude").join("rules").join(name), markdown).expect("write rule");
     }
 
     fn temp_repo() -> (PathBuf, PathBuf, PathBuf) {
@@ -201,6 +216,44 @@ mod tests {
         assert!(
             !cache_created,
             "no state should be written when nothing matches"
+        );
+    }
+
+    #[test]
+    fn a_valid_sibling_is_injected_while_invalid_rules_emit_a_system_message() {
+        let (root, repo, cache) = temp_repo();
+        write_rule(&repo, "invalid.md", "---\npaths: []\n---\nINVALID");
+        write_rule(&repo, "valid.md", "---\npaths: src/**\n---\nVALID");
+
+        let output = edit_src_app(&repo, &cache).expect("hook output");
+        let context = additional_context(Some(output.clone())).expect("valid context");
+        let system_message = output["systemMessage"].as_str().expect("system message");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            context.contains("VALID"),
+            "valid sibling should be injected"
+        );
+        assert!(
+            !context.contains("Invalid path rule") && !context.contains("invalid.md"),
+            "diagnostic must not reach additionalContext"
+        );
+        assert!(system_message.contains("invalid.md"));
+        assert!(system_message.contains("`paths:` must contain at least one glob"));
+    }
+
+    #[test]
+    fn invalid_rules_emit_a_system_message_without_additional_context() {
+        let (root, repo, cache) = temp_repo();
+        write_rule(&repo, "invalid.md", "---\npaths:\n---\nINVALID");
+
+        let output = edit_src_app(&repo, &cache).expect("diagnostic output");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(output["systemMessage"].as_str().is_some());
+        assert!(
+            output.get("hookSpecificOutput").is_none(),
+            "diagnostic-only output must not add agent context"
         );
     }
 }

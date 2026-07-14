@@ -27,6 +27,14 @@ pub(crate) struct Rule {
     pub(crate) content: String,
 }
 
+/// Rules discovered during a scan, plus non-fatal diagnostics for invalid rule
+/// content.
+#[derive(Debug)]
+pub(crate) struct RuleScan {
+    pub(crate) rules: Vec<Rule>,
+    pub(crate) diagnostics: Vec<String>,
+}
+
 /// Outcome of parsing a rule file's optional front matter.
 #[derive(Debug)]
 struct ParsedRule {
@@ -42,7 +50,7 @@ struct ParsedRule {
 ///
 /// Returns an error if the directory tree cannot be traversed or a rule file
 /// cannot be read.
-pub(crate) fn scan_rules(cwd: &Path) -> HookResult<Vec<Rule>> {
+pub(crate) fn scan_rules(cwd: &Path) -> HookResult<RuleScan> {
     let extra_dirs = env::var_os("CODEX_PATH_RULES_EXTRA_DIRS");
     scan_rules_with_extra_dirs(cwd, extra_dirs.as_deref())
 }
@@ -51,12 +59,18 @@ pub(crate) fn scan_rules(cwd: &Path) -> HookResult<Vec<Rule>> {
 /// directories. Project-local rules are always loaded first; extra directories
 /// are loaded in the order provided by the caller. Repeated directories are
 /// de-duplicated by canonical rule path so aliases cannot inject a rule twice.
-fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookResult<Vec<Rule>> {
+fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookResult<RuleScan> {
     let rules_dir = resolve_path(cwd, RULES_DIR);
     let mut rules = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut seen = HashSet::new();
 
-    append_new_rules(&mut rules, &mut seen, scan_rules_dir(&rules_dir)?);
+    append_new_rules(
+        &mut rules,
+        &mut seen,
+        &mut diagnostics,
+        scan_rules_dir(&rules_dir)?,
+    );
 
     if let Some(extra_dirs) = extra_dirs {
         for dir in env::split_paths(extra_dirs) {
@@ -69,16 +83,27 @@ fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookRes
             } else {
                 clean_path(cwd.join(dir))
             };
-            append_new_rules(&mut rules, &mut seen, scan_rules_dir(&rules_dir)?);
+            append_new_rules(
+                &mut rules,
+                &mut seen,
+                &mut diagnostics,
+                scan_rules_dir(&rules_dir)?,
+            );
         }
     }
 
-    Ok(rules)
+    Ok(RuleScan { rules, diagnostics })
 }
 
 /// Append rules whose keys have not already been seen.
-fn append_new_rules(rules: &mut Vec<Rule>, seen: &mut HashSet<String>, new_rules: Vec<Rule>) {
-    for rule in new_rules {
+fn append_new_rules(
+    rules: &mut Vec<Rule>,
+    seen: &mut HashSet<String>,
+    diagnostics: &mut Vec<String>,
+    scan: RuleScan,
+) {
+    diagnostics.extend(scan.diagnostics);
+    for rule in scan.rules {
         if seen.insert(rule.key.clone()) {
             rules.push(rule);
         }
@@ -86,15 +111,19 @@ fn append_new_rules(rules: &mut Vec<Rule>, seen: &mut HashSet<String>, new_rules
 }
 
 /// Discover and parse every rule under one rule directory.
-fn scan_rules_dir(rules_dir: &Path) -> HookResult<Vec<Rule>> {
+fn scan_rules_dir(rules_dir: &Path) -> HookResult<RuleScan> {
     if !rules_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(RuleScan {
+            rules: Vec::new(),
+            diagnostics: Vec::new(),
+        });
     }
 
     let mut files = find_markdown_files(rules_dir)?;
     files.sort();
 
     let mut rules = Vec::new();
+    let mut diagnostics = Vec::new();
     for absolute_path in files {
         let canonical_path = fs::canonicalize(&absolute_path).map_err(|error| {
             format!(
@@ -108,7 +137,13 @@ fn scan_rules_dir(rules_dir: &Path) -> HookResult<Vec<Rule>> {
                 path_to_string(&absolute_path)
             )
         })?;
-        let parsed = parse_rule_markdown(&markdown);
+        let parsed = match parse_rule_markdown(&markdown) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                diagnostics.push(format!("{}: {reason}", path_to_string(&absolute_path)));
+                continue;
+            }
+        };
         if parsed.content.is_empty() {
             continue;
         }
@@ -120,7 +155,7 @@ fn scan_rules_dir(rules_dir: &Path) -> HookResult<Vec<Rule>> {
         });
     }
 
-    Ok(rules)
+    Ok(RuleScan { rules, diagnostics })
 }
 
 /// Recursively collect regular `*.md` files under `dir`.
@@ -166,20 +201,20 @@ fn find_markdown_files(dir: &Path) -> HookResult<Vec<PathBuf>> {
 /// A leading UTF-8 BOM is ignored. Front matter is the block delimited by `---`
 /// lines at the very start of the file; its `paths:` entries become the rule's
 /// globs. With no front matter, the whole trimmed text is the body.
-fn parse_rule_markdown(markdown: &str) -> ParsedRule {
+fn parse_rule_markdown(markdown: &str) -> Result<ParsedRule, String> {
     let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
     let Some((first_line, mut position)) = read_line(text, 0) else {
-        return ParsedRule {
+        return Ok(ParsedRule {
             paths: None,
             content: text.trim().to_owned(),
-        };
+        });
     };
 
     if !is_frontmatter_delimiter(first_line) {
-        return ParsedRule {
+        return Ok(ParsedRule {
             paths: None,
             content: text.trim().to_owned(),
-        };
+        });
     }
 
     let frontmatter_start = position;
@@ -193,10 +228,17 @@ fn parse_rule_markdown(markdown: &str) -> ParsedRule {
             let raw_frontmatter = &text[frontmatter_start..line_start];
             let content = text[next_position..].trim().to_owned();
             let paths = parse_paths(raw_frontmatter);
-            return ParsedRule {
+            if raw_frontmatter
+                .lines()
+                .any(|line| line.trim().starts_with("paths:"))
+                && paths.is_empty()
+            {
+                return Err("`paths:` must contain at least one glob".to_owned());
+            }
+            return Ok(ParsedRule {
                 paths: (!paths.is_empty()).then_some(paths),
                 content,
-            };
+            });
         }
 
         if next_position == text.len() {
@@ -205,10 +247,7 @@ fn parse_rule_markdown(markdown: &str) -> ParsedRule {
         position = next_position;
     }
 
-    ParsedRule {
-        paths: None,
-        content: text.trim().to_owned(),
-    }
+    Err("front matter is not closed".to_owned())
 }
 
 /// Read one line starting at byte offset `start`, returning the line (without
@@ -432,35 +471,65 @@ mod tests {
 
     #[test]
     fn frontmatter_extracts_the_paths_list() {
-        let parsed = parse_rule_markdown("---\npaths:\n  - src/**\n---\n\nBody.");
+        let parsed =
+            parse_rule_markdown("---\npaths:\n  - src/**\n---\n\nBody.").expect("valid rule");
         assert_eq!(parsed.paths, Some(vec!["src/**".to_owned()]));
     }
 
     #[test]
     fn frontmatter_body_excludes_the_frontmatter() {
-        let parsed = parse_rule_markdown("---\npaths:\n  - src/**\n---\n\nBody.");
+        let parsed =
+            parse_rule_markdown("---\npaths:\n  - src/**\n---\n\nBody.").expect("valid rule");
         assert_eq!(parsed.content, "Body.");
     }
 
     #[test]
     fn markdown_without_frontmatter_has_no_paths() {
         assert_eq!(
-            parse_rule_markdown("# Title\n\nNo frontmatter.").paths,
+            parse_rule_markdown("# Title\n\nNo frontmatter.")
+                .expect("global rule")
+                .paths,
             None
         );
     }
 
     #[test]
     fn frontmatter_extracts_a_scalar_paths_value() {
-        let parsed = parse_rule_markdown("---\npaths: src/**\n---\n\nBody.");
+        let parsed = parse_rule_markdown("---\npaths: src/**\n---\n\nBody.").expect("valid rule");
         assert_eq!(parsed.paths, Some(vec!["src/**".to_owned()]));
     }
 
     #[test]
     fn frontmatter_ignores_a_leading_byte_order_mark() {
         assert_eq!(
-            parse_rule_markdown("\u{feff}---\npaths:\n  - a\n---\nBody").content,
+            parse_rule_markdown("\u{feff}---\npaths:\n  - a\n---\nBody")
+                .expect("valid rule")
+                .content,
             "Body"
+        );
+    }
+
+    #[test]
+    fn frontmatter_rejects_an_unclosed_fence() {
+        assert_eq!(
+            parse_rule_markdown("---\npaths: src/**\nBody.").unwrap_err(),
+            "front matter is not closed"
+        );
+    }
+
+    #[test]
+    fn frontmatter_rejects_an_empty_paths_value() {
+        assert_eq!(
+            parse_rule_markdown("---\npaths:\n---\nBody.").unwrap_err(),
+            "`paths:` must contain at least one glob"
+        );
+    }
+
+    #[test]
+    fn frontmatter_rejects_an_empty_paths_flow_list() {
+        assert_eq!(
+            parse_rule_markdown("---\npaths: []\n---\nBody.").unwrap_err(),
+            "`paths:` must contain at least one glob"
         );
     }
 
@@ -565,6 +634,7 @@ mod tests {
         let rules =
             scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
         let markers = rules
+            .rules
             .iter()
             .map(|rule| rule.content.as_str())
             .collect::<Vec<_>>();
@@ -584,8 +654,8 @@ mod tests {
             .expect("scan rules");
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].content, "SHARED");
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].content, "SHARED");
     }
 
     #[test]
@@ -598,7 +668,7 @@ mod tests {
         let rules = scan_rules_with_extra_dirs(&repo, Some(OsStr::new(""))).expect("scan rules");
         let _ = fs::remove_dir_all(&root);
 
-        assert!(rules.is_empty());
+        assert!(rules.rules.is_empty());
     }
 
     #[test]
@@ -620,8 +690,8 @@ mod tests {
             scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].content, "SHARED");
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].content, "SHARED");
     }
 
     #[test]
@@ -636,8 +706,8 @@ mod tests {
             scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].content, "SHARED");
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].content, "SHARED");
     }
 
     #[cfg(unix)]
@@ -657,8 +727,8 @@ mod tests {
             scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].content, "SHARED");
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(rules.rules[0].content, "SHARED");
     }
 
     // unquote ------------------------------------------------------------------
