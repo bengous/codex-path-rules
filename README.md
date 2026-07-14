@@ -2,7 +2,7 @@
 
 Path-scoped rule loading for Codex.
 
-`codex-path-rules` is a Codex command hook that reads `.claude/rules/*.md` and injects the matching rule body as `additionalContext` only when a tool call touches a matching path.
+`codex-path-rules` is a Codex command hook that reads path-scoped Markdown rules from the repo's `.claude/rules/` directory and any configured shared rule directories, then injects matching rule bodies as `additionalContext` only when a tool call touches a matching path.
 
 It exists for repos that already keep Claude-style path rules and do not want to load every rule into every Codex session.
 
