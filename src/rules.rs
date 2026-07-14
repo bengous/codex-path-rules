@@ -61,16 +61,13 @@ pub(crate) fn scan_rules(cwd: &Path) -> HookResult<RuleScan> {
 /// de-duplicated by canonical rule path so aliases cannot inject a rule twice.
 fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookResult<RuleScan> {
     let rules_dir = resolve_path(cwd, RULES_DIR);
-    let mut rules = Vec::new();
-    let mut diagnostics = Vec::new();
+    let mut scan = RuleScan {
+        rules: Vec::new(),
+        diagnostics: Vec::new(),
+    };
     let mut seen = HashSet::new();
 
-    append_new_rules(
-        &mut rules,
-        &mut seen,
-        &mut diagnostics,
-        scan_rules_dir(&rules_dir)?,
-    );
+    scan_rules_dir(&rules_dir, &mut seen, &mut scan)?;
 
     if let Some(extra_dirs) = extra_dirs {
         for dir in env::split_paths(extra_dirs) {
@@ -83,47 +80,26 @@ fn scan_rules_with_extra_dirs(cwd: &Path, extra_dirs: Option<&OsStr>) -> HookRes
             } else {
                 clean_path(cwd.join(dir))
             };
-            append_new_rules(
-                &mut rules,
-                &mut seen,
-                &mut diagnostics,
-                scan_rules_dir(&rules_dir)?,
-            );
+            scan_rules_dir(&rules_dir, &mut seen, &mut scan)?;
         }
     }
 
-    Ok(RuleScan { rules, diagnostics })
-}
-
-/// Append rules whose keys have not already been seen.
-fn append_new_rules(
-    rules: &mut Vec<Rule>,
-    seen: &mut HashSet<String>,
-    diagnostics: &mut Vec<String>,
-    scan: RuleScan,
-) {
-    diagnostics.extend(scan.diagnostics);
-    for rule in scan.rules {
-        if seen.insert(rule.key.clone()) {
-            rules.push(rule);
-        }
-    }
+    Ok(scan)
 }
 
 /// Discover and parse every rule under one rule directory.
-fn scan_rules_dir(rules_dir: &Path) -> HookResult<RuleScan> {
+fn scan_rules_dir(
+    rules_dir: &Path,
+    seen: &mut HashSet<String>,
+    scan: &mut RuleScan,
+) -> HookResult<()> {
     if !rules_dir.exists() {
-        return Ok(RuleScan {
-            rules: Vec::new(),
-            diagnostics: Vec::new(),
-        });
+        return Ok(());
     }
 
     let mut files = find_markdown_files(rules_dir)?;
     files.sort();
 
-    let mut rules = Vec::new();
-    let mut diagnostics = Vec::new();
     for absolute_path in files {
         let canonical_path = fs::canonicalize(&absolute_path).map_err(|error| {
             format!(
@@ -131,6 +107,10 @@ fn scan_rules_dir(rules_dir: &Path) -> HookResult<RuleScan> {
                 path_to_string(&absolute_path)
             )
         })?;
+        let key = path_to_string(&canonical_path);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
         let markdown = fs::read_to_string(&absolute_path).map_err(|error| {
             format!(
                 "failed to read rule {}: {error}",
@@ -140,7 +120,7 @@ fn scan_rules_dir(rules_dir: &Path) -> HookResult<RuleScan> {
         let parsed = match parse_rule_markdown(&markdown) {
             Ok(parsed) => parsed,
             Err(reason) => {
-                diagnostics.push(format!("{}: {reason}", path_to_string(&absolute_path)));
+                scan.diagnostics.push(format!("{key}: {reason}"));
                 continue;
             }
         };
@@ -148,14 +128,14 @@ fn scan_rules_dir(rules_dir: &Path) -> HookResult<RuleScan> {
             continue;
         }
 
-        rules.push(Rule {
-            key: path_to_string(&canonical_path),
+        scan.rules.push(Rule {
+            key,
             paths: parsed.paths,
             content: parsed.content,
         });
     }
 
-    Ok(RuleScan { rules, diagnostics })
+    Ok(())
 }
 
 /// Recursively collect regular `*.md` files under `dir`.
@@ -201,7 +181,7 @@ fn find_markdown_files(dir: &Path) -> HookResult<Vec<PathBuf>> {
 /// A leading UTF-8 BOM is ignored. Front matter is the block delimited by `---`
 /// lines at the very start of the file; its `paths:` entries become the rule's
 /// globs. With no front matter, the whole trimmed text is the body.
-fn parse_rule_markdown(markdown: &str) -> Result<ParsedRule, String> {
+fn parse_rule_markdown(markdown: &str) -> Result<ParsedRule, &'static str> {
     let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
     let Some((first_line, mut position)) = read_line(text, 0) else {
         return Ok(ParsedRule {
@@ -227,18 +207,8 @@ fn parse_rule_markdown(markdown: &str) -> Result<ParsedRule, String> {
         if is_frontmatter_delimiter(line) {
             let raw_frontmatter = &text[frontmatter_start..line_start];
             let content = text[next_position..].trim().to_owned();
-            let paths = parse_paths(raw_frontmatter);
-            if raw_frontmatter
-                .lines()
-                .any(|line| line.trim().starts_with("paths:"))
-                && paths.is_empty()
-            {
-                return Err("`paths:` must contain at least one glob".to_owned());
-            }
-            return Ok(ParsedRule {
-                paths: (!paths.is_empty()).then_some(paths),
-                content,
-            });
+            let paths = parse_paths(raw_frontmatter)?;
+            return Ok(ParsedRule { paths, content });
         }
 
         if next_position == text.len() {
@@ -247,7 +217,7 @@ fn parse_rule_markdown(markdown: &str) -> Result<ParsedRule, String> {
         position = next_position;
     }
 
-    Err("front matter is not closed".to_owned())
+    Err("front matter is not closed")
 }
 
 /// Read one line starting at byte offset `start`, returning the line (without
@@ -272,7 +242,7 @@ fn is_frontmatter_delimiter(line: &str) -> bool {
     line.trim_end_matches([' ', '\t']) == "---"
 }
 
-/// Extract the `paths` patterns from rule front matter.
+/// Extract and validate the `paths` patterns from rule front matter.
 ///
 /// Three YAML forms are understood, matching Claude Code's native rules: a
 /// block list (`paths:` then `- value` items), an inline flow list
@@ -280,35 +250,38 @@ fn is_frontmatter_delimiter(line: &str) -> bool {
 /// single- or double-quoted and may carry a trailing ` # comment`. Duplicates
 /// are dropped; for the block form, parsing stops at the first non-list line
 /// after `paths:`.
-fn parse_paths(frontmatter: &str) -> Vec<String> {
+fn parse_paths(frontmatter: &str) -> Result<Option<Vec<String>>, &'static str> {
     let mut lines = frontmatter.lines();
     while let Some(line) = lines.next() {
         let Some(rest) = line.trim().strip_prefix("paths:") else {
             continue;
         };
 
-        let rest = rest.trim();
-        if rest.is_empty() {
-            return parse_block_list(lines);
-        }
-        if rest.starts_with('[') {
-            return parse_flow_list(rest);
-        }
-
-        let value = unquote(rest);
-        return if value.is_empty() {
-            Vec::new()
+        let paths = if rest.trim().is_empty() {
+            parse_block_list(lines)?
+        } else if rest.trim().starts_with('[') {
+            parse_flow_list(rest.trim())?
         } else {
-            vec![value]
+            let value = unquote(rest.trim())?;
+            if value.is_empty() {
+                Vec::new()
+            } else {
+                vec![value]
+            }
         };
+
+        if paths.is_empty() {
+            return Err("`paths:` must contain at least one glob");
+        }
+        return Ok(Some(paths));
     }
 
-    Vec::new()
+    Ok(None)
 }
 
 /// Collect the `- value` items following a bare `paths:` line, stopping at the
 /// first non-empty line that is not a list item.
-fn parse_block_list<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+fn parse_block_list<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Vec<String>, &'static str> {
     let mut paths = Vec::new();
     for line in lines {
         let trimmed = line.trim();
@@ -319,45 +292,55 @@ fn parse_block_list<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
             break;
         };
 
-        let value = unquote(item.trim());
+        let value = unquote(item.trim())?;
         if !value.is_empty() && !paths.contains(&value) {
             paths.push(value);
         }
     }
 
-    paths
+    Ok(paths)
 }
 
 /// Parse an inline flow list such as `["a", "b"]`, splitting on top-level
 /// commas so a brace group like `{ts,tsx}` inside an item stays intact.
-fn parse_flow_list(rest: &str) -> Vec<String> {
+fn parse_flow_list(rest: &str) -> Result<Vec<String>, &'static str> {
     let body = rest.strip_prefix('[').unwrap_or(rest);
-    let body = body.rsplit_once(']').map_or(body, |(before, _)| before);
+    let Some((body, suffix)) = body.rsplit_once(']') else {
+        return Err("`paths:` flow list is not closed");
+    };
+    let suffix = suffix.trim();
+    if !suffix.is_empty() && !suffix.starts_with('#') {
+        return Err("unexpected content after `paths:` flow list");
+    }
 
     let mut paths = Vec::new();
     for item in split_top_level_commas(body) {
-        let value = unquote(item.trim());
+        let value = unquote(item.trim())?;
         if !value.is_empty() && !paths.contains(&value) {
             paths.push(value);
         }
     }
 
-    paths
+    Ok(paths)
 }
 
 /// Unwrap a single- or double-quoted scalar, or strip a trailing ` # comment`
 /// from a bare scalar.
-fn unquote(value: &str) -> String {
+fn unquote(value: &str) -> Result<String, &'static str> {
     if let Some(quote @ ('"' | '\'')) = value.chars().next() {
         let offset = quote.len_utf8();
-        if let Some(end) = value[offset..].find(quote) {
-            return value[offset..offset + end].to_owned();
+        let Some(end) = value[offset..].find(quote) else {
+            return Err("quoted `paths:` glob is not closed");
+        };
+        let trailing = value[offset + end + offset..].trim();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return Err("unexpected content after quoted `paths:` glob");
         }
-        return value.to_owned();
+        return Ok(value[offset..offset + end].to_owned());
     }
 
     let uncommented = value.find(" #").map_or(value, |index| &value[..index]);
-    uncommented.trim_end().to_owned()
+    Ok(uncommented.trim_end().to_owned())
 }
 
 /// Decide whether `trigger_path` activates `rule`.
@@ -392,10 +375,16 @@ mod tests {
 
     // parse_paths ------------------------------------------------------------
 
+    fn parsed_paths(frontmatter: &str) -> Vec<String> {
+        parse_paths(frontmatter)
+            .expect("valid paths")
+            .expect("paths key")
+    }
+
     #[test]
     fn parse_paths_collects_list_items() {
         assert_eq!(
-            parse_paths("paths:\n  - src/**\n  - docs/**\n"),
+            parsed_paths("paths:\n  - src/**\n  - docs/**\n"),
             ["src/**", "docs/**"]
         );
     }
@@ -403,67 +392,89 @@ mod tests {
     #[test]
     fn parse_paths_strips_surrounding_quotes() {
         assert_eq!(
-            parse_paths("paths:\n  - \"src/**/*.css\"\n"),
+            parsed_paths("paths:\n  - \"src/**/*.css\"\n"),
             ["src/**/*.css"]
         );
     }
 
     #[test]
     fn parse_paths_strips_inline_comment() {
-        assert_eq!(parse_paths("paths:\n  - src/** # styles\n"), ["src/**"]);
+        assert_eq!(parsed_paths("paths:\n  - src/** # styles\n"), ["src/**"]);
     }
 
     #[test]
     fn parse_paths_drops_duplicates() {
-        assert_eq!(parse_paths("paths:\n  - a\n  - a\n"), ["a"]);
+        assert_eq!(parsed_paths("paths:\n  - a\n  - a\n"), ["a"]);
     }
 
     #[test]
     fn parse_paths_stops_at_first_non_list_line() {
-        assert_eq!(parse_paths("paths:\n  - a\nother: x\n  - b\n"), ["a"]);
+        assert_eq!(parsed_paths("paths:\n  - a\nother: x\n  - b\n"), ["a"]);
     }
 
     #[test]
-    fn parse_paths_returns_empty_without_a_paths_key() {
-        assert!(parse_paths("name: rule\n").is_empty());
+    fn parse_paths_returns_none_without_a_paths_key() {
+        assert_eq!(
+            parse_paths("name: rule\n").expect("valid front matter"),
+            None
+        );
     }
 
     #[test]
     fn parse_paths_reads_a_scalar_value() {
-        assert_eq!(parse_paths("paths: src/**/*.svelte\n"), ["src/**/*.svelte"]);
+        assert_eq!(
+            parsed_paths("paths: src/**/*.svelte\n"),
+            ["src/**/*.svelte"]
+        );
     }
 
     #[test]
     fn parse_paths_reads_a_quoted_scalar_value() {
         assert_eq!(
-            parse_paths("paths: \"**/agents/**/*.md\"\n"),
+            parsed_paths("paths: \"**/agents/**/*.md\"\n"),
             ["**/agents/**/*.md"]
         );
     }
 
     #[test]
     fn parse_paths_strips_an_inline_comment_from_a_scalar() {
-        assert_eq!(parse_paths("paths: src/** # styles\n"), ["src/**"]);
+        assert_eq!(parsed_paths("paths: src/** # styles\n"), ["src/**"]);
     }
 
     #[test]
     fn parse_paths_reads_an_inline_flow_list() {
         assert_eq!(
-            parse_paths("paths: [\"src/**/*.ts\", \"lib/**\"]\n"),
+            parsed_paths("paths: [\"src/**/*.ts\", \"lib/**\"]\n"),
             ["src/**/*.ts", "lib/**"]
         );
     }
 
     #[test]
     fn parse_paths_reads_an_unquoted_inline_flow_list() {
-        assert_eq!(parse_paths("paths: [a, b]\n"), ["a", "b"]);
+        assert_eq!(parsed_paths("paths: [a, b]\n"), ["a", "b"]);
     }
 
     #[test]
     fn parse_paths_keeps_a_brace_group_inside_a_flow_list_intact() {
         assert_eq!(
-            parse_paths("paths: [\"src/**/*.{ts,tsx}\"]\n"),
+            parsed_paths("paths: [\"src/**/*.{ts,tsx}\"]\n"),
             ["src/**/*.{ts,tsx}"]
+        );
+    }
+
+    #[test]
+    fn parse_paths_rejects_an_unclosed_flow_list() {
+        assert_eq!(
+            parse_paths("paths: [src/**\n").unwrap_err(),
+            "`paths:` flow list is not closed"
+        );
+    }
+
+    #[test]
+    fn parse_paths_rejects_an_unclosed_quoted_glob() {
+        assert_eq!(
+            parse_paths("paths: \"src/**\n").unwrap_err(),
+            "quoted `paths:` glob is not closed"
         );
     }
 
@@ -710,6 +721,22 @@ mod tests {
         assert_eq!(rules.rules[0].content, "SHARED");
     }
 
+    #[test]
+    fn scan_rules_deduplicates_diagnostics_from_repeated_extra_rule_dirs() {
+        let root = create_temp_dir("rules-extra-invalid-dedup").expect("temp dir");
+        let repo = root.join("repo");
+        let extra = root.join("shared-rules");
+        fs::create_dir_all(&extra).expect("create rules dir");
+        fs::write(extra.join("invalid.md"), "---\npaths: []\n---\nINVALID")
+            .expect("write invalid rule");
+
+        let joined = env::join_paths([&extra, &extra]).expect("join paths");
+        let scan = scan_rules_with_extra_dirs(&repo, Some(joined.as_os_str())).expect("scan rules");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(scan.diagnostics.len(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn scan_rules_deduplicates_symlinked_extra_rule_dir_aliases() {
@@ -735,16 +762,16 @@ mod tests {
 
     #[test]
     fn unquote_removes_double_quotes() {
-        assert_eq!(unquote("\"a/b\""), "a/b");
+        assert_eq!(unquote("\"a/b\"").expect("quoted path"), "a/b");
     }
 
     #[test]
     fn unquote_removes_single_quotes() {
-        assert_eq!(unquote("'a/b'"), "a/b");
+        assert_eq!(unquote("'a/b'").expect("quoted path"), "a/b");
     }
 
     #[test]
     fn unquote_strips_a_trailing_comment_from_a_bare_value() {
-        assert_eq!(unquote("a/b # note"), "a/b");
+        assert_eq!(unquote("a/b # note").expect("bare path"), "a/b");
     }
 }
