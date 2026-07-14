@@ -102,12 +102,14 @@ Keep component styles in the matching stylesheet.
 - Fails open: hook errors are printed to stderr and never block the tool call.
 - Caches state under `~/.cache/codex-path-rules/` (respects `XDG_CACHE_HOME`; override with `CODEX_PATH_RULES_CACHE`). Session state idle for 7 days is swept on reset events, and lock directories leaked by a killed hook are broken after 60 seconds.
 
-For `Bash`, path detection is intentionally lightweight. It recognizes common read commands such as `cat`, `nl`, `less`, `more`, `sed`, `head`, `tail`, `rg`, and `grep`. For edits, it reads path fields and patch headers from `apply_patch`, `Edit`, `Write`, and `MultiEdit` payloads.
+For `Bash`, path detection is intentionally lightweight. It recognizes common read commands such as `cat`, `nl`, `less`, `more`, `sed`, `head`, `tail`, `rg`, and `grep`. It also reads pathspecs after a literal `--` for direct `git diff`, `git show`, `git log`, and `git blame` commands, plus explicit contiguous roots before the first predicate or operator in `find`. For edits, it reads path fields and patch headers from `apply_patch`, `Edit`, `Write`, and `MultiEdit` payloads.
 
 ## Known limitations
 
 - Some Codex releases do not fire `PreToolUse` for `apply_patch` or MCP tools ([openai/codex#16732](https://github.com/openai/codex/issues/16732)); affected rules then inject on the next matching `Bash` call instead.
 - Bash path extraction is a best-effort lexer, not a full shell parser: redirections, subshells, and unrecognized commands contribute no paths.
+- Git detection does not infer paths from refs, options, `REV:path`, commands without a literal `--`, unsupported subcommands, or invocations with global Git options.
+- Find detection requires at least one explicit root, does not support global options, and stops collecting roots at the first token beginning with `-`, `(`, or `!`.
 
 ## Development
 

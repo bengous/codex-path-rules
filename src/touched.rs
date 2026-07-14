@@ -134,11 +134,12 @@ fn split_command_segments(tokens: &[String]) -> Vec<Vec<String>> {
 ///
 /// Leading `NAME=value` environment assignments are ignored, then the command
 /// name selects how its arguments are interpreted (`cat`/`sed`/`head`/`tail`/
-/// `rg`/`grep`). Unrecognized commands contribute no paths.
+/// `rg`/`grep`, direct `git diff`/`show`/`log`/`blame`, and `find`).
+/// Unrecognized commands contribute no paths.
 fn extract_segment_paths(segment: &[String], cwd: &Path) -> Vec<String> {
     let tokens = segment
         .iter()
-        .filter(|token| !is_environment_assignment(token))
+        .skip_while(|token| is_environment_assignment(token))
         .cloned()
         .collect::<Vec<_>>();
     let command = tokens
@@ -179,6 +180,27 @@ fn extract_segment_paths(segment: &[String], cwd: &Path) -> Vec<String> {
             cwd,
             &["-e", "--regexp", "-f", "--file", "-m", "-A", "-B", "-C"],
         );
+    }
+    if command == "git"
+        && matches!(
+            args.first().map(String::as_str),
+            Some("diff" | "show" | "log" | "blame")
+        )
+    {
+        let Some(separator) = args.iter().position(|arg| arg == "--") else {
+            return Vec::new();
+        };
+        return args[separator + 1..]
+            .iter()
+            .flat_map(|arg| expand_path_arg(arg, cwd))
+            .collect();
+    }
+    if command == "find" {
+        return args
+            .iter()
+            .take_while(|arg| !arg.starts_with(['-', '(', '!']))
+            .flat_map(|arg| expand_path_arg(arg, cwd))
+            .collect();
     }
 
     Vec::new()
@@ -578,6 +600,110 @@ mod tests {
     #[test]
     fn bash_paths_are_empty_for_an_unhandled_command() {
         assert!(extract_bash_paths("echo hello", Path::new("/repo")).is_empty());
+    }
+
+    #[test]
+    fn bash_paths_read_git_diff_pathspecs_after_the_separator() {
+        assert_eq!(
+            extract_bash_paths("git diff main -- src/lib.rs README.md", Path::new("/repo")),
+            ["src/lib.rs", "README.md"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_keep_a_git_pathspec_that_looks_like_an_assignment() {
+        assert_eq!(
+            extract_bash_paths("git diff -- RULE=name", Path::new("/repo")),
+            ["RULE=name"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_read_git_show_pathspecs_after_the_separator() {
+        assert_eq!(
+            extract_bash_paths("git show HEAD -- src/touched.rs", Path::new("/repo")),
+            ["src/touched.rs"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_read_git_log_pathspecs_after_the_separator() {
+        assert_eq!(
+            extract_bash_paths("git log -- README.md", Path::new("/repo")),
+            ["README.md"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_read_git_blame_pathspecs_after_the_separator() {
+        assert_eq!(
+            extract_bash_paths("git blame HEAD -- src/lib.rs", Path::new("/repo")),
+            ["src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_ignore_git_arguments_without_a_separator() {
+        assert!(extract_bash_paths("git diff main src/lib.rs", Path::new("/repo")).is_empty());
+    }
+
+    #[test]
+    fn bash_paths_ignore_git_revision_path_syntax() {
+        assert!(extract_bash_paths("git show HEAD:README.md", Path::new("/repo")).is_empty());
+    }
+
+    #[test]
+    fn bash_paths_ignore_unsupported_git_subcommands() {
+        assert!(extract_bash_paths("git status -- src/lib.rs", Path::new("/repo")).is_empty());
+    }
+
+    #[test]
+    fn bash_paths_ignore_git_with_global_options() {
+        assert!(
+            extract_bash_paths("git -C other diff -- src/lib.rs", Path::new("/repo")).is_empty()
+        );
+    }
+
+    #[test]
+    fn bash_paths_read_contiguous_find_roots() {
+        assert_eq!(
+            extract_bash_paths("find src tests -type f", Path::new("/repo")),
+            ["src", "tests"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_keep_a_find_root_that_looks_like_an_assignment() {
+        assert_eq!(
+            extract_bash_paths("find RULE=name -type f", Path::new("/repo")),
+            ["RULE=name"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_stop_find_roots_at_an_expression_group() {
+        assert_eq!(
+            extract_bash_paths("find src ( -name '*.rs' )", Path::new("/repo")),
+            ["src"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_stop_find_roots_at_negation() {
+        assert_eq!(
+            extract_bash_paths("find src ! -path target", Path::new("/repo")),
+            ["src"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_do_not_infer_a_find_root() {
+        assert!(extract_bash_paths("find -type f", Path::new("/repo")).is_empty());
+    }
+
+    #[test]
+    fn bash_paths_ignore_find_with_a_global_option() {
+        assert!(extract_bash_paths("find -H src -type f", Path::new("/repo")).is_empty());
     }
 
     // extract_patch_paths ----------------------------------------------------
