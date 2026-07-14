@@ -69,16 +69,18 @@ Codex requires project-local hooks to be trusted before they run. Use `/hooks` i
 To load shared rule directories in addition to the current repo's `.claude/rules`, set `CODEX_PATH_RULES_EXTRA_DIRS` in the environment that launches Codex:
 
 ```sh
-CODEX_PATH_RULES_EXTRA_DIRS="$HOME/work/agent-rules" codex
+CODEX_PATH_RULES_EXTRA_DIRS="$HOME/.claude/rules" codex
 ```
 
-Multiple directories use the platform path separator:
+`$HOME/.claude/rules` is Claude Code's user-level rules directory. You can use any existing custom directory instead.
+
+Multiple directories use the platform path separator (`:` on macOS/Linux, `;` on Windows). For example, on macOS/Linux:
 
 ```sh
 CODEX_PATH_RULES_EXTRA_DIRS="$HOME/work/agent-rules:$HOME/.claude/rules" codex
 ```
 
-You can also pin the variable on the hook command itself:
+On macOS/Linux, you can also pin the variable on the hook command itself:
 
 ```toml
 [[hooks.PreToolUse.hooks]]
@@ -117,7 +119,7 @@ Keep component styles in the matching stylesheet.
 ## Behavior
 
 - Reads Markdown rules recursively under `.claude/rules/`; symlinked rule files are ignored.
-- Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`; repeated rule paths are de-duplicated.
+- Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`; repeated rule paths and aliases are de-duplicated.
 - Supports `paths:` as a scalar, block list, or inline list; globs support `*`, `**`, `?`, and `{a,b}` brace alternation.
 - Injects each rule once per session; resets on `SessionStart` (startup/clear), `SessionEnd`, and `PostCompact`.
 - Budgets injection at 6000 characters per rule and 12000 per batch. A rule that does not fit the current batch is deferred: it stays eligible and is injected by the next matching tool call, never silently lost.
