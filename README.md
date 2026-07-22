@@ -16,7 +16,7 @@ It exists for repos that already keep Claude-style path rules and do not want to
 ### Download a verified binary
 
 Download the archive for your platform and `SHA256SUMS` from the
-[`v0.3.1` release](https://github.com/bengous/codex-path-rules/releases/tag/v0.3.1):
+[`v0.3.2` release](https://github.com/bengous/codex-path-rules/releases/tag/v0.3.2):
 
 | Platform | Archive |
 | --- | --- |
@@ -48,10 +48,10 @@ also includes the project and third-party license notices.
 
 ### Compile the release tag
 
-Install Rust 1.96.0, then compile the exact release tag with Cargo:
+Install Rust 1.97.1, then compile the exact release tag with Cargo:
 
 ```sh
-cargo +1.96.0 install --locked --git https://github.com/bengous/codex-path-rules --tag v0.3.1
+cargo +1.97.1 install --locked --git https://github.com/bengous/codex-path-rules --tag v0.3.2
 ```
 
 ## Configure Codex

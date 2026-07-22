@@ -4,7 +4,7 @@ A Codex CLI hook (Rust binary) that injects `.claude/rules/*.md` bodies as `addi
 
 ## Commands
 
-Toolchain is pinned to 1.96.0 (`rust-toolchain.toml`, `.mise.toml`); CI runs exactly these four gates:
+Toolchain is pinned to 1.97.1 (`rust-toolchain.toml`, `.mise.toml`); CI runs exactly these four gates:
 
 ```sh
 cargo fmt --check

@@ -1,8 +1,8 @@
 [package]
 name = "codex-path-rules"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.1"
 description = "Path-scoped Codex hook that loads .claude/rules only when matching files are touched"
 license = "MIT"
 repository = "https://github.com/bengous/codex-path-rules"
@@ -11,7 +11,7 @@ keywords = ["codex", "hooks", "rules", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 
 [lints.rust]
