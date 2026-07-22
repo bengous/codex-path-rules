@@ -383,9 +383,27 @@ fn sanitize_file_name(value: &str) -> String {
         .collect()
 }
 
-/// The user's home directory from `HOME`, falling back to `.` when unset.
+/// The user's home directory from Unix or Windows environment conventions.
 fn home_dir() -> PathBuf {
-    env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+    resolve_home_dir(
+        env::var_os("HOME"),
+        env::var_os("USERPROFILE"),
+        cfg!(windows),
+    )
+}
+
+fn resolve_home_dir(
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+    windows: bool,
+) -> PathBuf {
+    let non_empty = |value: Option<std::ffi::OsString>| value.filter(|path| !path.is_empty());
+    let resolved = if windows {
+        non_empty(user_profile).or_else(|| non_empty(home))
+    } else {
+        non_empty(home).or_else(|| non_empty(user_profile))
+    };
+    resolved.map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 /// Parent process id, used only to disambiguate the fallback session
@@ -409,6 +427,22 @@ fn parent_process_id() -> u32 {
 mod tests {
     use super::*;
     use crate::selftest::create_temp_dir;
+
+    #[test]
+    fn windows_home_prefers_a_non_empty_user_profile() {
+        assert_eq!(
+            resolve_home_dir(
+                Some("/home/unix".into()),
+                Some(r"C:\Users\reader".into()),
+                true
+            ),
+            PathBuf::from(r"C:\Users\reader")
+        );
+        assert_eq!(
+            resolve_home_dir(Some("/home/unix".into()), Some("".into()), true),
+            PathBuf::from("/home/unix")
+        );
+    }
 
     #[test]
     fn read_state_returns_default_when_the_cache_is_missing() {

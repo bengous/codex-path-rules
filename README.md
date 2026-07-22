@@ -13,8 +13,45 @@ It exists for repos that already keep Claude-style path rules and do not want to
 
 ## Install
 
+### Download a verified binary
+
+Download the archive for your platform and `SHA256SUMS` from the
+[`v0.3.1` release](https://github.com/bengous/codex-path-rules/releases/tag/v0.3.1):
+
+| Platform | Archive |
+| --- | --- |
+| Linux x64 (glibc 2.35+) | `codex-path-rules-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Intel | `codex-path-rules-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `codex-path-rules-aarch64-apple-darwin.tar.gz` |
+| Windows x64 | `codex-path-rules-x86_64-pc-windows-msvc.zip` |
+
+Verify the downloaded archive before extracting it:
+
 ```sh
-cargo install --locked --git https://github.com/bengous/codex-path-rules
+sha256sum --ignore-missing --check SHA256SUMS
+```
+
+On macOS, use `shasum -a 256 <archive>` and compare its output with the
+matching line in `SHA256SUMS`. On Windows, use
+`Get-FileHash <archive> -Algorithm SHA256` and compare it likewise. Extract
+`codex-path-rules` (`codex-path-rules.exe` on Windows) into an existing user
+directory in `PATH`, then verify it:
+
+```sh
+codex-path-rules --version
+codex-path-rules --self-test
+```
+
+Release archives are checksummed but not signed or notarized. Compile the tag
+from source when you need the strongest available provenance. Each archive
+also includes the project and third-party license notices.
+
+### Compile the release tag
+
+Install Rust 1.96.0, then compile the exact release tag with Cargo:
+
+```sh
+cargo +1.96.0 install --locked --git https://github.com/bengous/codex-path-rules --tag v0.3.1
 ```
 
 ## Configure Codex
