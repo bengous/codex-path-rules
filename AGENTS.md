@@ -13,7 +13,7 @@ cargo test --all-targets --all-features --locked
 cargo run --locked -- --self-test
 ```
 
-Single test: `cargo test render_defers` (name substring). Tests are unit tests colocated in each module's `#[cfg(test)] mod tests`; there is no `tests/` directory. The self-test (`src/selftest.rs`) is an end-to-end scenario compiled into the production binary and also run as a unit test.
+Single test: `cargo test render_defers` (name substring). Unit tests are colocated in each module's `#[cfg(test)] mod tests`; `tests/cli.rs` covers process-level CLI behavior. The self-test (`src/selftest.rs`) is an end-to-end scenario compiled into the production binary and also run as a unit test.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ Library (`src/lib.rs`, one module per concern) + thin CLI (`src/main.rs`). Publi
 
 ## Invariants (violating these reintroduces fixed bugs)
 
-- **Fail open**: this is a context-injection hook, never a gate. Runtime errors go to stderr and the process exits 0; only `--self-test` may exit nonzero. Errors are contextualized strings (`HookResult<T> = Result<T, String>`), never silently swallowed.
+- **Fail open**: this is a context-injection hook, never a gate. Hook runtime errors go to stderr and the process exits 0; self-test failures and invalid CLI arguments may exit nonzero. Errors are contextualized strings (`HookResult<T> = Result<T, String>`), never silently swallowed.
 - **Only emitted rules are marked injected.** `render_rules` may *defer* a rule that overflows the 12000-char batch budget (6000 per rule, truncation notice counted inside the limit); a deferred rule must stay out of `injectedRules` so a later matching call injects it. Marking before rendering loses rules for the whole session.
 - **Only displayed diagnostics are marked warned.** Invalid rules remain out of agent context; their canonical keys enter `warnedRules` only when the hook emits the human-facing `systemMessage`.
 - **Rule bodies reach the model verbatim** except literal `</rule>`, which is neutralized. Do not HTML-escape: it corrupts code samples and inflates lengths past the budget math.

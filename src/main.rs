@@ -7,23 +7,42 @@ use std::io::{self, Read};
 use std::process;
 
 fn main() {
-    if env::args().any(|arg| arg == "--self-test") {
-        match codex_path_rules::run_self_test() {
-            Ok(()) => {
-                println!("path-rules self-test passed");
+    let mut args = env::args().skip(1);
+    let first = args.next();
+    let extra = args.next();
+
+    match (first.as_deref(), extra) {
+        (Some("--self-test"), None) => {
+            match codex_path_rules::run_self_test() {
+                Ok(()) => println!("path-rules self-test passed"),
+                Err(error) => {
+                    eprintln!("[path-rules] self-test failed: {error}");
+                    process::exit(1);
+                }
             }
-            Err(error) => {
-                eprintln!("[path-rules] self-test failed: {error}");
-                process::exit(1);
-            }
+            return;
         }
-        return;
+        (Some("--version" | "-V"), None) => {
+            println!("codex-path-rules {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        (Some("--help" | "-h"), None) => {
+            println!(
+                "codex-path-rules {}\n\nUsage: codex-path-rules [--help | --version | --self-test]\n\nReads a Codex hook payload from stdin and writes hook output to stdout.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return;
+        }
+        (None, None) => {}
+        _ => {
+            eprintln!("codex-path-rules: invalid arguments; use --help");
+            process::exit(2);
+        }
     }
 
     // Fail open: a context-injection hook must never block the developer's
     // tool call, so a runtime error is reported on stderr and the process
-    // still exits 0. The `--self-test` branch above is the only path allowed
-    // to exit nonzero.
+    // still exits 0. CLI validation and self-test failures may exit nonzero.
     if let Err(error) = run_cli() {
         eprintln!("[path-rules] {error}");
     }

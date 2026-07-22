@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: codex-path-rules-x86_64-unknown-linux-gnu.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: codex-path-rules-x86_64-apple-darwin.tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: codex-path-rules-aarch64-apple-darwin.tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: codex-path-rules-x86_64-pc-windows-msvc.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Test
+        run: cargo test --all-targets --all-features --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Archive release binary
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist package
+          cp target/release/codex-path-rules LICENSE THIRD_PARTY_LICENSES package/
+          tar -czf "dist/${{ matrix.archive }}" -C package codex-path-rules LICENSE THIRD_PARTY_LICENSES
+      - name: Archive release binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist, package
+          Copy-Item target/release/codex-path-rules.exe, LICENSE, THIRD_PARTY_LICENSES package
+          Compress-Archive package/* "dist/${{ matrix.archive }}"
+      - name: Verify archived binary
+        if: runner.os != 'Windows'
+        run: |
+          mkdir extracted
+          tar -xzf "dist/${{ matrix.archive }}" -C extracted
+          test -f extracted/LICENSE
+          test -f extracted/THIRD_PARTY_LICENSES
+          extracted/codex-path-rules --self-test
+          test "$(extracted/codex-path-rules --version)" = "codex-path-rules 0.3.1"
+      - name: Verify archived binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive "dist/${{ matrix.archive }}" extracted
+          if (-not (Test-Path extracted/LICENSE)) { exit 1 }
+          if (-not (Test-Path extracted/THIRD_PARTY_LICENSES)) { exit 1 }
+          & extracted/codex-path-rules.exe --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = & extracted/codex-path-rules.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($version -ne "codex-path-rules 0.3.1") { exit 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum codex-path-rules-* > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: checksums
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir verified
+          tar -xzf dist/codex-path-rules-x86_64-unknown-linux-gnu.tar.gz -C verified
+          test "$(verified/codex-path-rules --version)" = "codex-path-rules ${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft \
+            --verify-tag \
+            --title "codex-path-rules ${GITHUB_REF_NAME}" \
+            --notes "Prebuilt archives are covered by SHA256SUMS. Binaries are not signed or notarized."
+          gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false
