@@ -146,8 +146,9 @@ pub(crate) fn run_hook_with_cache(
 /// Format a rule diagnostic for the human-facing `systemMessage`, using a
 /// repository-relative path when possible.
 fn format_rule_diagnostic(diagnostic: &RuleDiagnostic, cwd: &Path) -> String {
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let path = Path::new(&diagnostic.key)
-        .strip_prefix(cwd)
+        .strip_prefix(canonical_cwd)
         .map(path_to_posix)
         .unwrap_or_else(|_| diagnostic.key.clone());
     format!("{path}: {}", diagnostic.reason)
@@ -339,5 +340,28 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(message, format!("{}: invalid", path_to_string(&external)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_rule_diagnostic_is_relative_through_a_cwd_alias() {
+        use std::os::unix::fs::symlink;
+
+        let root = create_temp_dir("hook-diagnostic-alias").expect("temp dir");
+        let repo = root.join("repo");
+        let alias = root.join("repo-alias");
+        let rule = repo.join(".claude/rules/invalid.md");
+        fs::create_dir_all(rule.parent().expect("rule parent")).expect("rules dir");
+        fs::write(&rule, "invalid").expect("rule");
+        symlink(&repo, &alias).expect("repo alias");
+        let diagnostic = RuleDiagnostic {
+            key: path_to_string(&rule.canonicalize().expect("canonical rule")),
+            reason: "invalid",
+        };
+
+        let message = format_rule_diagnostic(&diagnostic, &alias);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(message, ".claude/rules/invalid.md: invalid");
     }
 }
