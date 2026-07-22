@@ -8,7 +8,7 @@ It exists for repos that already keep Claude-style path rules and do not want to
 
 ## Requirements
 
-- A Codex CLI recent enough to honor `hookSpecificOutput.additionalContext` on `PreToolUse` ([openai/codex#20692](https://github.com/openai/codex/pull/20692), May 2026). Older releases reject the hook output as unsupported and inject nothing.
+- Codex CLI 0.129.0 or newer. Earlier releases reject `hookSpecificOutput.additionalContext` on `PreToolUse` as unsupported and inject nothing ([openai/codex#20692](https://github.com/openai/codex/pull/20692)).
 - Hooks enabled. Recent Codex releases enable the `hooks` feature by default; older ones need `[features] hooks = true`.
 
 ## Install
