@@ -14,9 +14,9 @@ use crate::HookResult;
 use crate::hook::run_hook_with_cache;
 use crate::pathutil::path_to_string;
 
-/// Build a throwaway repository with one CSS rule, then exercise injection,
-/// once-per-session de-duplication, reset on `PostCompact` and `SessionEnd`,
-/// and `rg --files` discovery end to end.
+/// Build a throwaway repository with root and nested rules, then exercise lazy
+/// discovery, injection, once-per-session de-duplication, reset on `PostCompact`
+/// and `SessionEnd`, and `rg --files` discovery end to end.
 ///
 /// # Errors
 ///
@@ -30,6 +30,13 @@ pub fn run_self_test() -> HookResult<()> {
         .map_err(|error| format!("failed to create self-test rules directory: {error}"))?;
     fs::create_dir_all(repo.join("src").join("styles"))
         .map_err(|error| format!("failed to create self-test styles directory: {error}"))?;
+    fs::create_dir_all(
+        repo.join("apps")
+            .join("journal")
+            .join(".claude")
+            .join("rules"),
+    )
+    .map_err(|error| format!("failed to create nested rules directory: {error}"))?;
     fs::write(
         repo.join("src").join("styles").join("stage.css"),
         ".stage {}\n",
@@ -51,6 +58,24 @@ pub fn run_self_test() -> HookResult<()> {
         .join("\n"),
     )
     .map_err(|error| format!("failed to write self-test rule: {error}"))?;
+    fs::write(
+        repo.join("apps")
+            .join("journal")
+            .join(".claude")
+            .join("rules")
+            .join("svelte.md"),
+        [
+            "---",
+            "paths: src/**/*.svelte",
+            "---",
+            "",
+            "# Svelte rule",
+            "",
+            "Keep journal islands local.",
+        ]
+        .join("\n"),
+    )
+    .map_err(|error| format!("failed to write nested self-test rule: {error}"))?;
 
     let first = run_hook_with_cache(
         &json!({
@@ -99,6 +124,38 @@ pub fn run_self_test() -> HookResult<()> {
         Some(&cache),
     )?;
     require(second.is_none(), "rule was reinjected in the same session")?;
+
+    let sibling = run_hook_with_cache(
+        &json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "test-session",
+            "cwd": path_to_string(&repo),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "apps/portfolio/src/App.svelte" },
+        }),
+        &repo,
+        Some(&cache),
+    )?;
+    require(
+        sibling.is_none(),
+        "nested rule matched a sibling project path",
+    )?;
+
+    let nested = run_hook_with_cache(
+        &json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "test-session",
+            "cwd": path_to_string(&repo),
+            "tool_name": "Bash",
+            "tool_input": { "command": "cd apps/journal && cat src/App.svelte" },
+        }),
+        &repo,
+        Some(&cache),
+    )?;
+    require(
+        additional_context(nested)?.contains("Keep journal islands local."),
+        "nested rule was not loaded for its project path",
+    )?;
 
     run_hook_with_cache(
         &json!({

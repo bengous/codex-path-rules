@@ -85,12 +85,15 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn rule(key: &str, content: String) -> Rule {
         Rule {
             key: key.to_owned(),
             paths: None,
+            scope_root: PathBuf::from("/repo"),
             content,
         }
     }

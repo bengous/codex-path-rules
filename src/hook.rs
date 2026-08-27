@@ -32,7 +32,7 @@ pub(crate) fn run_hook(input: &Value, fallback_cwd: &Path) -> HookResult<Option<
 /// sweeps stale cache entries, and returns `None`. On `PreToolUse` it matches
 /// the touched paths against the discovered rules and returns `Some(output)`
 /// carrying the `additionalContext` for the matching rules not yet injected
-/// this session, plus a top-level `systemMessage` once per invalid rule per
+/// this session, plus a top-level `systemMessage` once per rule warning per
 /// session.
 /// Only the rules actually emitted are marked as injected: a rule deferred by
 /// the batch budget stays eligible for the next matching tool call. All other
@@ -76,7 +76,7 @@ pub(crate) fn run_hook_with_cache(
         return Ok(None);
     }
 
-    let scan = scan_rules(&cwd)?;
+    let scan = scan_rules(&cwd, &touched_paths);
     let matched = scan
         .rules
         .into_iter()
@@ -123,7 +123,7 @@ pub(crate) fn run_hook_with_cache(
             .iter()
             .map(|diagnostic| format_rule_diagnostic(diagnostic, &cwd))
             .collect::<Vec<_>>();
-        format!("Invalid path rule(s):\n- {}", messages.join("\n- "))
+        format!("Path rule warning(s):\n- {}", messages.join("\n- "))
     });
 
     if system_message.is_none() && context.is_none() {
@@ -174,19 +174,26 @@ mod tests {
         fs::write(repo.join(".claude").join("rules").join(name), body).expect("write rule");
     }
 
-    fn edit_src_app(repo: &Path, cache: &Path) -> Option<Value> {
+    fn edit_path_result(repo: &Path, cache: &Path, file_path: &str) -> HookResult<Option<Value>> {
         run_hook_with_cache(
             &json!({
                 "hook_event_name": "PreToolUse",
                 "session_id": "test-session",
                 "cwd": path_to_string(repo),
                 "tool_name": "Edit",
-                "tool_input": { "file_path": "src/app.ts" },
+                "tool_input": { "file_path": file_path },
             }),
             repo,
             Some(cache),
         )
-        .expect("hook run should succeed")
+    }
+
+    fn edit_path(repo: &Path, cache: &Path, file_path: &str) -> Option<Value> {
+        edit_path_result(repo, cache, file_path).expect("hook run should succeed")
+    }
+
+    fn edit_src_app(repo: &Path, cache: &Path) -> Option<Value> {
+        edit_path(repo, cache, "src/app.ts")
     }
 
     fn write_rule(repo: &Path, name: &str, markdown: &str) {
@@ -251,6 +258,126 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_rule_loads_only_for_a_path_inside_its_scope() {
+        let (root, repo, cache) = temp_repo();
+        let rules_dir = repo.join("apps/journal/.claude/rules");
+        fs::create_dir_all(&rules_dir).expect("nested rules dir");
+        fs::write(
+            rules_dir.join("svelte.md"),
+            "---\npaths: src/**/*.svelte\n---\nJOURNAL-SVELTE",
+        )
+        .expect("write nested rule");
+
+        let sibling = edit_path(&repo, &cache, "apps/portfolio/src/components/App.svelte");
+        let nested = additional_context(edit_path(
+            &repo,
+            &cache,
+            "apps/journal/src/components/App.svelte",
+        ))
+        .expect("nested context");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(sibling.is_none());
+        assert!(nested.contains("JOURNAL-SVELTE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_nested_rules_directory_does_not_hide_matching_root_rules() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, repo, cache) = temp_repo();
+        write_rule(&repo, "root.md", "---\npaths: apps/**\n---\nROOT-RULE");
+        let nested_rules = repo.join("apps/journal/.claude/rules");
+        fs::create_dir_all(&nested_rules).expect("nested rules dir");
+        fs::set_permissions(&nested_rules, fs::Permissions::from_mode(0o000))
+            .expect("make nested rules unreadable");
+
+        let result = edit_path_result(&repo, &cache, "apps/journal/src/App.svelte");
+        fs::set_permissions(&nested_rules, fs::Permissions::from_mode(0o755))
+            .expect("restore nested rules permissions");
+        let _ = fs::remove_dir_all(&root);
+
+        let output = result
+            .expect("unreadable nested rules should not fail the scan")
+            .expect("matching root rule output");
+        let warning = output["systemMessage"]
+            .as_str()
+            .expect("unreadable nested rules warning");
+        assert!(warning.contains("Permission denied"));
+        let context = additional_context(Some(output)).expect("root rule context");
+        assert!(context.contains("ROOT-RULE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_nested_rules_directory_cannot_load_external_rules() {
+        use std::os::unix::fs::symlink;
+
+        let (root, repo, cache) = temp_repo();
+        let external_rules = root.join("external-rules");
+        fs::create_dir_all(&external_rules).expect("external rules dir");
+        fs::write(
+            external_rules.join("external.md"),
+            "---\npaths: src/**\n---\nEXTERNAL-RULE",
+        )
+        .expect("external rule");
+        let nested_claude = repo.join("apps/journal/.claude");
+        fs::create_dir_all(&nested_claude).expect("nested .claude dir");
+        symlink(&external_rules, nested_claude.join("rules")).expect("nested rules symlink");
+
+        let output = edit_path(&repo, &cache, "apps/journal/src/App.svelte");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn a_regular_file_at_the_root_rules_path_does_not_fail_the_hook() {
+        let (root, repo, cache) = temp_repo();
+        let rules_path = repo.join(".claude/rules");
+        fs::remove_dir_all(&rules_path).expect("remove rules dir");
+        fs::write(&rules_path, "not a directory").expect("write rules file");
+
+        let result = edit_path_result(&repo, &cache, "src/App.ts");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "regular rules file should be ignored: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_rule_loads_after_cd_changes_the_shell_directory() {
+        let (root, repo, cache) = temp_repo();
+        let rules_dir = repo.join("apps/journal/.claude/rules");
+        fs::create_dir_all(&rules_dir).expect("nested rules dir");
+        fs::write(
+            rules_dir.join("svelte.md"),
+            "---\npaths: src/**/*.svelte\n---\nJOURNAL-SVELTE",
+        )
+        .expect("write nested rule");
+
+        let output = run_hook_with_cache(
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "test-session",
+                "cwd": path_to_string(&repo),
+                "tool_name": "Bash",
+                "tool_input": { "command": "cd apps/journal && cat src/components/App.svelte" },
+            }),
+            &repo,
+            Some(&cache),
+        )
+        .expect("hook run should succeed");
+        let _ = fs::remove_dir_all(&root);
+
+        let context = additional_context(output).expect("nested rule context");
+        assert!(context.contains("JOURNAL-SVELTE"));
+    }
+
+    #[test]
     fn a_valid_sibling_is_injected_while_invalid_rules_emit_a_system_message() {
         let (root, repo, cache) = temp_repo();
         write_rule(&repo, "invalid.md", "---\npaths: []\n---\nINVALID");
@@ -266,7 +393,7 @@ mod tests {
             "valid sibling should be injected"
         );
         assert!(
-            !context.contains("Invalid path rule") && !context.contains("invalid.md"),
+            !context.contains("Path rule warning") && !context.contains("invalid.md"),
             "diagnostic must not reach additionalContext"
         );
         assert!(
@@ -333,7 +460,7 @@ mod tests {
         let external = root.join("shared-rules").join("invalid.md");
         let diagnostic = RuleDiagnostic {
             key: path_to_string(&external),
-            reason: "invalid",
+            reason: "invalid".to_owned(),
         };
 
         let message = format_rule_diagnostic(&diagnostic, &cwd);
@@ -356,7 +483,7 @@ mod tests {
         symlink(&repo, &alias).expect("repo alias");
         let diagnostic = RuleDiagnostic {
             key: path_to_string(&rule.canonicalize().expect("canonical rule")),
-            reason: "invalid",
+            reason: "invalid".to_owned(),
         };
 
         let message = format_rule_diagnostic(&diagnostic, &alias);

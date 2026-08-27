@@ -69,9 +69,9 @@ fn extract_patch_paths(command: &str) -> Vec<String> {
 
 /// Extract the file paths a Bash command reads.
 ///
-/// The command is tokenized and split on `|`, `;`, `&&`, and `||`; a
-/// `bash -c` / `sh -c` wrapper is unwrapped and its inner script re-parsed.
-/// Each segment is then inspected by [`extract_segment_paths`].
+/// The command is tokenized and split on `|`, `;`, `&&`, and `||`; a direct
+/// `cd` before `;` or `&&` updates the working directory for later segments.
+/// A `bash -c` / `sh -c` wrapper is unwrapped and its script is re-parsed.
 fn extract_bash_paths(command: &str, cwd: &Path) -> Vec<String> {
     let tokens = tokenize_shell(command);
     if tokens.is_empty() {
@@ -83,8 +83,28 @@ fn extract_bash_paths(command: &str, cwd: &Path) -> Vec<String> {
     }
 
     let mut paths = Vec::new();
+    let mut command_cwd = cwd.to_path_buf();
     for segment in split_command_segments(&tokens) {
-        paths.extend(extract_segment_paths(&segment, cwd));
+        if let Some(next_cwd) = extract_cd_target(segment.tokens, &command_cwd) {
+            if matches!(
+                segment.next_operator,
+                None | Some(ShellOperator::Sequence | ShellOperator::And)
+            ) {
+                command_cwd = next_cwd;
+            }
+            continue;
+        }
+
+        let segment_paths = extract_segment_paths(segment.tokens, &command_cwd);
+        if command_cwd == cwd {
+            paths.extend(segment_paths);
+        } else {
+            paths.extend(
+                segment_paths
+                    .into_iter()
+                    .map(|path| rebase_path(&path, &command_cwd, cwd)),
+            );
+        }
     }
 
     unique_paths(paths)
@@ -105,29 +125,78 @@ fn unwrap_shell(tokens: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// Split tokens into command segments at the `|`, `;`, `&&`, and `||`
-/// operators, dropping the operators themselves.
-fn split_command_segments(tokens: &[String]) -> Vec<Vec<String>> {
-    let mut segments = Vec::new();
-    let mut current = Vec::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellOperator {
+    Pipe,
+    Sequence,
+    And,
+    Or,
+}
 
-    for token in tokens {
-        if matches!(token.as_str(), "|" | ";" | "&&" | "||") {
-            if !current.is_empty() {
-                segments.push(current);
-                current = Vec::new();
-            }
-            continue;
+impl ShellOperator {
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "|" => Some(Self::Pipe),
+            ";" => Some(Self::Sequence),
+            "&&" => Some(Self::And),
+            "||" => Some(Self::Or),
+            _ => None,
         }
+    }
+}
 
-        current.push(token.clone());
+#[derive(Debug, PartialEq, Eq)]
+struct CommandSegment<'a> {
+    tokens: &'a [String],
+    next_operator: Option<ShellOperator>,
+}
+
+/// Split tokens into command segments while preserving each trailing operator.
+fn split_command_segments(tokens: &[String]) -> Vec<CommandSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(operator) = ShellOperator::parse(token) {
+            if start < index {
+                segments.push(CommandSegment {
+                    tokens: &tokens[start..index],
+                    next_operator: Some(operator),
+                });
+            }
+            start = index + 1;
+        }
     }
 
-    if !current.is_empty() {
-        segments.push(current);
+    if start < tokens.len() {
+        segments.push(CommandSegment {
+            tokens: &tokens[start..],
+            next_operator: None,
+        });
     }
 
     segments
+}
+
+fn extract_cd_target(segment: &[String], cwd: &Path) -> Option<PathBuf> {
+    let tokens = segment
+        .iter()
+        .skip_while(|token| is_environment_assignment(token))
+        .cloned()
+        .collect::<Vec<_>>();
+    if basename(tokens.first()?) != "cd" {
+        return None;
+    }
+    let target = positional_args(&tokens[1..], &[]).into_iter().next()?;
+    Some(resolve_path(cwd, &target))
+}
+
+fn rebase_path(path: &str, command_cwd: &Path, session_cwd: &Path) -> String {
+    let absolute_path = resolve_path(command_cwd, path);
+    absolute_path
+        .strip_prefix(session_cwd)
+        .map(path_to_posix)
+        .unwrap_or_else(|_| path_to_posix(&absolute_path))
 }
 
 /// Extract file paths from a single command segment.
@@ -562,6 +631,28 @@ mod tests {
         assert_eq!(
             extract_bash_paths("bash -c 'cat src/app.ts'", Path::new("/repo")),
             ["src/app.ts"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_resolve_files_after_cd_from_the_session_cwd() {
+        assert_eq!(
+            extract_bash_paths(
+                "cd apps/journal && cat src/components/App.svelte",
+                Path::new("/repo")
+            ),
+            ["apps/journal/src/components/App.svelte"]
+        );
+    }
+
+    #[test]
+    fn bash_paths_do_not_apply_pipeline_cd_to_the_next_segment() {
+        assert_eq!(
+            extract_bash_paths(
+                "cd apps/journal | cat src/components/App.svelte",
+                Path::new("/repo")
+            ),
+            ["src/components/App.svelte"]
         );
     }
 

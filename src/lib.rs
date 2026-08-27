@@ -4,9 +4,9 @@
 //! `SessionStart`, `SessionEnd`, and `PostCompact` events (wired in
 //! `.codex/config.toml`). The hook payload arrives as JSON on stdin. For
 //! `PreToolUse` the hook inspects the paths a tool is about to touch; whenever
-//! a touched path matches the `paths:` globs of a rule file under
-//! `.claude/rules`, that rule's body is emitted once per session as
-//! `additionalContext`, giving the agent the relevant guidance just in time.
+//! a touched path matches a rule under `cwd/.claude/rules` or a nested project
+//! scope, that rule's body is emitted once per session as `additionalContext`,
+//! giving the agent the relevant guidance just in time.
 //! Which rules were already injected is cached per session; the cache is
 //! cleared on `SessionStart`/`SessionEnd`/`PostCompact`.
 //!

@@ -2,7 +2,7 @@
 
 Path-scoped rule loading for Codex.
 
-`codex-path-rules` is a Codex command hook that reads path-scoped Markdown rules from the repo's `.claude/rules/` directory and any configured shared rule directories, then injects matching rule bodies as `additionalContext` only when a tool call touches a matching path.
+`codex-path-rules` is a Codex command hook that reads path-scoped Markdown rules from `.claude/rules/` at the Codex working directory, from nested `.claude/rules/` directories along each touched path, and from any configured shared rule directories. It injects matching rule bodies as `additionalContext` only when a tool call touches a matching path.
 
 It exists for repos that already keep Claude-style path rules and do not want to load every rule into every Codex session.
 
@@ -103,7 +103,7 @@ statusMessage = "Resetting path rules"
 
 Codex requires project-local hooks to be trusted before they run. Use `/hooks` in the Codex CLI when prompted.
 
-To load shared rule directories in addition to the current repo's `.claude/rules`, set `CODEX_PATH_RULES_EXTRA_DIRS` in the environment that launches Codex:
+Nested project rules are discovered automatically and do not need extra configuration. To load shared rule directories outside the current project, set `CODEX_PATH_RULES_EXTRA_DIRS` in the environment that launches Codex:
 
 ```sh
 CODEX_PATH_RULES_EXTRA_DIRS="$HOME/.claude/rules" codex
@@ -143,6 +143,8 @@ paths:
 Keep component styles in the matching stylesheet.
 ```
 
+In a monorepo, a rule at `apps/journal/.claude/rules/svelte.md` uses paths relative to `apps/journal`. For example, `src/**/*.svelte` matches `apps/journal/src/App.svelte` but not `apps/portfolio/src/App.svelte`.
+
 When a matching path is touched, Codex receives:
 
 ```xml
@@ -155,23 +157,25 @@ Keep component styles in the matching stylesheet.
 
 ## Behavior
 
-- Reads Markdown rules recursively under `.claude/rules/`; symlinked rule files are ignored.
-- Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`; repeated rule paths and aliases are de-duplicated.
+- Reads Markdown rules recursively under `cwd/.claude/rules/`, then under each nested `.claude/rules/` directory along a touched path. It does not scan unrelated project subtrees. Project rule directory symlinks and symlinked rule files are ignored; explicitly configured shared directory symlinks remain allowed.
+- Matches each project rule relative to the directory that contains its `.claude/` directory. A nested rule without `paths:` applies throughout that nested scope, not the whole project.
+- Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`; their globs remain relative to `cwd`; repeated rule paths and aliases are de-duplicated.
 - Supports `paths:` as a scalar, block list, or inline list; globs support `*`, `**`, `?`, and `{a,b}` brace alternation.
-- Rules without front matter apply globally. A leading `---` opens front matter and must have a closing fence.
-- Skips malformed rules and empty `paths:` values without blocking the tool call. Codex shows each invalid-rule warning once per session through `systemMessage`; warnings are never added to agent context.
+- Rules without front matter apply throughout their rule scope. A leading `---` opens front matter and must have a closing fence.
+- Skips malformed rules and empty `paths:` values without blocking the tool call. An unreadable rule directory also leaves valid rules available. Codex shows each rule warning once per session through `systemMessage`; warnings are never added to agent context.
 - Injects each rule once per session; resets on `SessionStart` (startup/clear), `SessionEnd`, and `PostCompact`.
 - Budgets injection at 6000 characters per rule and 12000 per batch. A rule that does not fit the current batch is deferred: it stays eligible and is injected by the next matching tool call, never silently lost.
 - Rule bodies reach the model verbatim, except literal `</rule>` sequences, which are neutralized so a rule cannot break out of its wrapper block.
 - Fails open: hook errors are printed to stderr and never block the tool call.
 - Caches state under `~/.cache/codex-path-rules/` (respects `XDG_CACHE_HOME`; override with `CODEX_PATH_RULES_CACHE`). Session state idle for 7 days is swept on reset events, and lock directories leaked by a killed hook are broken after 60 seconds.
 
-For `Bash`, path detection is intentionally lightweight. It recognizes common read commands such as `cat`, `nl`, `less`, `more`, `sed`, `head`, `tail`, `rg`, and `grep`. It also reads pathspecs after a literal `--` for direct `git diff`, `git show`, `git log`, and `git blame` commands, plus explicit contiguous roots before the first predicate or operator in `find`. For edits, it reads path fields and patch headers from `apply_patch`, `Edit`, `Write`, and `MultiEdit` payloads.
+For `Bash`, path detection is intentionally lightweight. It recognizes common read commands such as `cat`, `nl`, `less`, `more`, `sed`, `head`, `tail`, `rg`, and `grep`. A direct `cd <dir>` segment before `&&` or `;` updates the base for later paths. The hook also reads pathspecs after a literal `--` for direct `git diff`, `git show`, `git log`, and `git blame` commands, plus explicit contiguous roots before the first predicate or operator in `find`. For edits, it reads path fields and patch headers from `apply_patch`, `Edit`, `Write`, and `MultiEdit` payloads.
 
 ## Known limitations
 
+- Project rule discovery starts at the hook `cwd`; it does not search parent directories or detect a Git root. Start Codex from the intended project root when parent rules must apply.
 - The reference matcher excludes MCP tools because their names and input schemas vary by server. To cover one, add its tool name to the matcher; path extraction can read only direct `path`, `file_path`, or `filePath` fields from an otherwise unrecognized tool input.
-- Bash path extraction is a best-effort lexer, not a full shell parser. Only the commands listed above have dedicated handling; redirections and subshells may be missed or misclassified.
+- Bash path extraction is a best-effort lexer, not a full shell parser. Only the commands listed above and direct `cd` segments have dedicated handling; redirections, grouped commands, and complex conditional chains may be missed or misclassified.
 - Git detection handles only direct `git diff`, `git show`, `git log`, and `git blame` commands with a literal `--`. Global Git options, other subcommands, paths before `--`, and `REV:path` are ignored.
 - Find detection reads explicit roots until the first predicate or operator. It does not infer the default `.` root or handle global options.
 - Each directory operand expands to the directory itself and at most 200 files beneath it. `.git`, `node_modules`, `dist`, and unreadable directories are skipped.
