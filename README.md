@@ -16,7 +16,7 @@ It exists for repos that already keep Claude-style path rules and do not want to
 ### Download a verified binary
 
 Download the archive for your platform and `SHA256SUMS` from the
-[`v0.4.0` release](https://github.com/bengous/codex-path-rules/releases/tag/v0.4.0):
+[latest release](https://github.com/bengous/codex-path-rules/releases/latest):
 
 | Platform | Archive |
 | --- | --- |
@@ -48,10 +48,14 @@ also includes the project and third-party license notices.
 
 ### Compile the release tag
 
-Install Rust 1.97.1, then compile the exact release tag with Cargo:
+Install Rust 1.97.1, then compile the exact release tag with Cargo.
+Replace `<tag>` with the tag named on the
+[latest release](https://github.com/bengous/codex-path-rules/releases/latest)
+page.
 
 ```sh
-cargo +1.97.1 install --locked --git https://github.com/bengous/codex-path-rules --tag v0.4.0
+cargo +1.97.1 install --locked \
+  --git https://github.com/bengous/codex-path-rules --tag <tag>
 ```
 
 ## Configure Codex
@@ -159,7 +163,7 @@ Keep component styles in the matching stylesheet.
 
 - Reads Markdown rules recursively under `cwd/.claude/rules/`, then under each nested `.claude/rules/` directory along a touched path. It does not scan unrelated project subtrees. Project rule directory symlinks and symlinked rule files are ignored; explicitly configured shared directory symlinks remain allowed.
 - Matches each project rule relative to the directory that contains its `.claude/` directory. A nested rule without `paths:` applies throughout that nested scope, not the whole project.
-- Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`; their globs remain relative to `cwd`; repeated rule paths and aliases are de-duplicated.
+- Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`. A shared directory outside the project keeps its globs relative to `cwd`; an extra directory that names a project's own `.claude/rules` keeps that directory's project scope instead. Repeated rule paths and aliases are de-duplicated.
 - Supports `paths:` as a scalar, block list, or inline list; globs support `*`, `**`, `?`, and `{a,b}` brace alternation.
 - Rules without front matter apply throughout their rule scope. A leading `---` opens front matter and must have a closing fence.
 - Skips malformed rules and empty `paths:` values without blocking the tool call. An unreadable rule directory also leaves valid rules available. Codex shows each rule warning once per session through `systemMessage`; warnings are never added to agent context.

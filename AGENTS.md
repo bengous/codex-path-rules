@@ -22,7 +22,7 @@ Library (`src/lib.rs`, one module per concern) + thin CLI (`src/main.rs`). Publi
 `PreToolUse` flow through `hook::run_hook_with_cache` (the orchestrator, and the entry point tests use to simulate whole sessions against a temp `cache_root`):
 
 1. `touched` extracts paths from the tool input (path fields, `apply_patch` bodies, and a best-effort shell lexer for `Bash` — deliberately not a full parser). Direct `cd` segments before `&&` or `;` update the base for later paths.
-2. `rules` models project and shared sources separately, scans `cwd/.claude/rules` plus nested rule directories along touched paths, and matches each path relative to its rule scope. Project directory symlinks are skipped; explicit shared directory symlinks are allowed. Scan errors become diagnostics so valid rules remain available. No lock or state IO happens unless at least one rule matches or a diagnostic exists.
+2. `rules` models project and shared sources separately, scans `cwd/.claude/rules` plus nested rule directories along touched paths, and matches each path relative to its rule scope. An extra directory that names a project `.claude/rules` keeps that project scope. Project directory symlinks are skipped; explicit shared directory symlinks are allowed. Scan errors become diagnostics so valid rules remain available. No lock or state IO happens unless at least one rule matches or a diagnostic exists.
 3. `session` guards per-session state (`injectedRules` and `warnedRules` in a JSON file under the cache root, namespaced by cwd hash) with a `create_dir`-based lock.
 4. `render` produces the batch and returns which rules were actually emitted.
 
