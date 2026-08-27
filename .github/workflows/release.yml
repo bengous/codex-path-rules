@@ -57,7 +57,8 @@ jobs:
           test -f extracted/LICENSE
           test -f extracted/THIRD_PARTY_LICENSES
           extracted/codex-path-rules --self-test
-          test "$(extracted/codex-path-rules --version)" = "codex-path-rules 0.3.2"
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
+          test "$(extracted/codex-path-rules --version)" = "codex-path-rules ${version}"
       - name: Verify archived binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -69,7 +70,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $version = & extracted/codex-path-rules.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($version -ne "codex-path-rules 0.3.2") { exit 1 }
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          if ($version -ne "codex-path-rules $($metadata.packages[0].version)") { exit 1 }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
