@@ -73,7 +73,6 @@ matcher = "^(Bash|apply_patch|Edit|Write|MultiEdit)$"
 type = "command"
 command = "codex-path-rules"
 timeout = 10
-statusMessage = "Loading path rules"
 
 # `resume` is deliberately excluded: a resumed session keeps its context, so
 # rules already injected must stay de-duplicated.
@@ -128,7 +127,6 @@ On macOS/Linux, you can also pin the variable on the hook command itself:
 type = "command"
 command = "CODEX_PATH_RULES_EXTRA_DIRS=$HOME/work/agent-rules codex-path-rules"
 timeout = 10
-statusMessage = "Loading path rules"
 ```
 
 ## Rule Files
@@ -159,6 +157,13 @@ Keep component styles in the matching stylesheet.
 </rule>
 ```
 
+Codex also shows this human-facing message only when the rule is actually injected:
+
+```text
+Path rules loaded:
+- .claude/rules/frontend.md
+```
+
 ## Behavior
 
 - Reads Markdown rules recursively under `cwd/.claude/rules/`, then under each nested `.claude/rules/` directory along a touched path. It does not scan unrelated project subtrees. Project rule directory symlinks and symlinked rule files are ignored; explicitly configured shared directory symlinks remain allowed.
@@ -166,6 +171,7 @@ Keep component styles in the matching stylesheet.
 - Also reads Markdown rules from each directory in `CODEX_PATH_RULES_EXTRA_DIRS`, after project-local rules. Relative extra directories resolve against the hook `cwd`. A shared directory outside the project keeps its globs relative to `cwd`; an extra directory that names a project's own `.claude/rules` keeps that directory's project scope instead. Repeated rule paths and aliases are de-duplicated.
 - Supports `paths:` as a scalar, block list, or inline list; globs support `*`, `**`, `?`, and `{a,b}` brace alternation.
 - Rules without front matter apply throughout their rule scope. A leading `---` opens front matter and must have a closing fence.
+- Reports every successfully injected rule through `systemMessage`. Project rule paths are relative to `cwd`; shared external rule paths stay absolute. Already-injected rules stay silent, and deferred rules are reported only when a later batch injects them.
 - Skips malformed rules and empty `paths:` values without blocking the tool call. An unreadable rule directory also leaves valid rules available. Codex shows each rule warning once per session through `systemMessage`; warnings are never added to agent context.
 - Injects each rule once per session; resets on `SessionStart` (startup/clear), `SessionEnd`, and `PostCompact`.
 - Budgets injection at 6000 characters per rule and 12000 per batch. A rule that does not fit the current batch is deferred: it stays eligible and is injected by the next matching tool call, never silently lost.

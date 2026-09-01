@@ -88,6 +88,14 @@ pub fn run_self_test() -> HookResult<()> {
         &repo,
         Some(&cache),
     )?;
+    require(
+        first
+            .as_ref()
+            .and_then(|output| output.get("systemMessage"))
+            .and_then(Value::as_str)
+            == Some("Path rules loaded:\n- .claude/rules/css.md"),
+        "expected CSS rule load message",
+    )?;
     let first_context = additional_context(first)?;
     require(
         first_context.contains("Keep CSS in feature files."),
@@ -180,6 +188,14 @@ pub fn run_self_test() -> HookResult<()> {
         Some(&cache),
     )?;
     require(
+        after_compact
+            .as_ref()
+            .and_then(|output| output.get("systemMessage"))
+            .and_then(Value::as_str)
+            == Some("Path rules loaded:\n- .claude/rules/css.md"),
+        "compact reset did not restore the load message",
+    )?;
+    require(
         additional_context(after_compact)?.contains("CSS rule"),
         "compact reset did not allow reinjection",
     )?;
@@ -203,6 +219,14 @@ pub fn run_self_test() -> HookResult<()> {
         }),
         &repo,
         Some(&cache),
+    )?;
+    require(
+        after_session_end
+            .as_ref()
+            .and_then(|output| output.get("systemMessage"))
+            .and_then(Value::as_str)
+            == Some("Path rules loaded:\n- .claude/rules/css.md"),
+        "session end reset did not restore the load message",
     )?;
     require(
         additional_context(after_session_end)?.contains("CSS rule"),

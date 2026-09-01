@@ -16,6 +16,36 @@ use crate::session::{
 };
 use crate::touched::extract_touched_paths;
 
+enum PreToolUseOutput {
+    Diagnostics {
+        system_message: String,
+    },
+    Injection {
+        system_message: String,
+        additional_context: String,
+    },
+}
+
+impl PreToolUseOutput {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Diagnostics { system_message } => json!({
+                "systemMessage": system_message,
+            }),
+            Self::Injection {
+                system_message,
+                additional_context,
+            } => json!({
+                "systemMessage": system_message,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": additional_context,
+                },
+            }),
+        }
+    }
+}
+
 /// Run the hook against an already-parsed payload, using the default on-disk
 /// cache location.
 ///
@@ -32,8 +62,8 @@ pub(crate) fn run_hook(input: &Value, fallback_cwd: &Path) -> HookResult<Option<
 /// sweeps stale cache entries, and returns `None`. On `PreToolUse` it matches
 /// the touched paths against the discovered rules and returns `Some(output)`
 /// carrying the `additionalContext` for the matching rules not yet injected
-/// this session, plus a top-level `systemMessage` once per rule warning per
-/// session.
+/// this session, plus a top-level `systemMessage` listing those rules. Rule
+/// diagnostics also appear in `systemMessage` once per session.
 /// Only the rules actually emitted are marked as injected: a rule deferred by
 /// the batch budget stays eligible for the next matching tool call. All other
 /// events, and calls with neither context nor diagnostics, return `None`
@@ -105,6 +135,34 @@ pub(crate) fn run_hook_with_cache(
     let emitted_context = !batch.emitted_keys.is_empty();
     let emitted_diagnostics = !diagnostics.is_empty();
 
+    let warning_message = emitted_diagnostics.then(|| {
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| format_rule_diagnostic(diagnostic, &cwd))
+            .collect::<Vec<_>>();
+        format!("Path rule warning(s):\n- {}", messages.join("\n- "))
+    });
+    let output = if emitted_context {
+        let paths = batch
+            .emitted_keys
+            .iter()
+            .map(|key| format_rule_path(key, &cwd))
+            .collect::<Vec<_>>();
+        let loaded_message = format!("Path rules loaded:\n- {}", paths.join("\n- "));
+        let system_message = if let Some(warning) = warning_message {
+            format!("{warning}\n\n{loaded_message}")
+        } else {
+            loaded_message
+        };
+
+        Some(PreToolUseOutput::Injection {
+            system_message,
+            additional_context: batch.context,
+        })
+    } else {
+        warning_message.map(|system_message| PreToolUseOutput::Diagnostics { system_message })
+    };
+
     if emitted_context {
         state.injected_rules.extend(batch.emitted_keys);
     }
@@ -117,41 +175,22 @@ pub(crate) fn run_hook_with_cache(
         write_state(&cwd, &session_id, cache_root, &state)?;
     }
 
-    let context = emitted_context.then_some(batch.context);
-    let system_message = emitted_diagnostics.then(|| {
-        let messages = diagnostics
-            .iter()
-            .map(|diagnostic| format_rule_diagnostic(diagnostic, &cwd))
-            .collect::<Vec<_>>();
-        format!("Path rule warning(s):\n- {}", messages.join("\n- "))
-    });
-
-    if system_message.is_none() && context.is_none() {
-        return Ok(None);
-    }
-
-    let mut output = json!({});
-    if let Some(system_message) = system_message {
-        output["systemMessage"] = Value::String(system_message);
-    }
-    if let Some(context) = context {
-        output["hookSpecificOutput"] = json!({
-            "hookEventName": "PreToolUse",
-            "additionalContext": context,
-        });
-    }
-    Ok(Some(output))
+    Ok(output.map(PreToolUseOutput::into_value))
 }
 
 /// Format a rule diagnostic for the human-facing `systemMessage`, using a
 /// repository-relative path when possible.
 fn format_rule_diagnostic(diagnostic: &RuleDiagnostic, cwd: &Path) -> String {
+    let path = format_rule_path(&diagnostic.key, cwd);
+    format!("{path}: {}", diagnostic.reason)
+}
+
+fn format_rule_path(key: &str, cwd: &Path) -> String {
     let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let path = Path::new(&diagnostic.key)
+    Path::new(key)
         .strip_prefix(canonical_cwd)
         .map(path_to_posix)
-        .unwrap_or_else(|_| diagnostic.key.clone());
-    format!("{path}: {}", diagnostic.reason)
+        .unwrap_or_else(|_| key.to_owned())
 }
 
 #[cfg(test)]
@@ -231,6 +270,52 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_rule_is_announced_only_in_its_injection_batch() {
+        let (root, repo, cache) = temp_repo();
+        write_oversized_rule(&repo, "a.md", "RULE-ALPHA");
+        write_oversized_rule(&repo, "b.md", "RULE-BRAVO");
+
+        let first = edit_src_app(&repo, &cache).expect("first output");
+        let second = edit_src_app(&repo, &cache).expect("second output");
+        let messages = (
+            first["systemMessage"].as_str().map(ToOwned::to_owned),
+            second["systemMessage"].as_str().map(ToOwned::to_owned),
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            messages,
+            (
+                Some("Path rules loaded:\n- .claude/rules/a.md".to_owned()),
+                Some("Path rules loaded:\n- .claude/rules/b.md".to_owned()),
+            )
+        );
+    }
+
+    #[test]
+    fn an_injected_rule_message_is_emitted_once_per_session() {
+        let (root, repo, cache) = temp_repo();
+        write_rule(
+            &repo,
+            "typescript.md",
+            "---\npaths: src/**\n---\nTYPESCRIPT",
+        );
+
+        let first = edit_src_app(&repo, &cache).expect("first output");
+        let message = first["systemMessage"].as_str().map(ToOwned::to_owned);
+        let second = edit_src_app(&repo, &cache);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            (message, second),
+            (
+                Some("Path rules loaded:\n- .claude/rules/typescript.md".to_owned()),
+                None,
+            )
+        );
+    }
+
+    #[test]
     fn a_non_matching_call_leaves_no_state_behind() {
         let (root, repo, cache) = temp_repo();
         write_oversized_rule(&repo, "a.md", "RULE-ALPHA");
@@ -269,16 +354,20 @@ mod tests {
         .expect("write nested rule");
 
         let sibling = edit_path(&repo, &cache, "apps/portfolio/src/components/App.svelte");
-        let nested = additional_context(edit_path(
-            &repo,
-            &cache,
-            "apps/journal/src/components/App.svelte",
-        ))
-        .expect("nested context");
+        let nested_output = edit_path(&repo, &cache, "apps/journal/src/components/App.svelte")
+            .expect("nested output");
+        let nested_message = nested_output["systemMessage"]
+            .as_str()
+            .map(ToOwned::to_owned);
+        let nested = additional_context(Some(nested_output)).expect("nested context");
         let _ = fs::remove_dir_all(&root);
 
         assert!(sibling.is_none());
         assert!(nested.contains("JOURNAL-SVELTE"));
+        assert_eq!(
+            nested_message,
+            Some("Path rules loaded:\n- apps/journal/.claude/rules/svelte.md".to_owned())
+        );
     }
 
     #[cfg(unix)]
@@ -401,7 +490,10 @@ mod tests {
                 && !system_message.contains(&path_to_string(&repo)),
             "project rule path should be relative: {system_message}"
         );
-        assert!(system_message.contains("`paths:` must contain at least one glob"));
+        assert_eq!(
+            system_message,
+            "Path rule warning(s):\n- .claude/rules/invalid.md: `paths:` must contain at least one glob\n\nPath rules loaded:\n- .claude/rules/valid.md"
+        );
     }
 
     #[test]
@@ -467,6 +559,18 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(message, format!("{}: invalid", path_to_string(&external)));
+    }
+
+    #[test]
+    fn an_external_rule_load_message_keeps_its_absolute_path() {
+        let root = create_temp_dir("hook-loaded-rule-path").expect("temp dir");
+        let cwd = root.join("repo");
+        let external = root.join("shared-rules").join("valid.md");
+
+        let path = format_rule_path(&path_to_string(&external), &cwd);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(path, path_to_string(&external));
     }
 
     #[cfg(unix)]
