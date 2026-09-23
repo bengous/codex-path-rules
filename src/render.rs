@@ -8,10 +8,6 @@ use crate::rules::Rule;
 const MAX_RULE_CHARS: usize = 6000;
 /// Maximum number of characters emitted across all rules in one injection.
 const MAX_BATCH_CHARS: usize = 12000;
-/// Appended in place of content dropped by [`truncate`]; counted within the
-/// per-rule budget.
-const TRUNCATION_NOTICE: &str =
-    "\n[Rule truncated. Read the rule file for full details if needed.]";
 /// Separator between rendered rule blocks.
 const BLOCK_JOINER: &str = "\n\n";
 
@@ -38,7 +34,11 @@ pub(crate) fn render_rules(candidates: &[Rule]) -> RenderedBatch {
     let mut remaining = MAX_BATCH_CHARS;
 
     for rule in candidates {
-        let content = truncate(&neutralize_rule_closer(&rule.content), MAX_RULE_CHARS);
+        let content = truncate(
+            &neutralize_rule_closer(&rule.content),
+            MAX_RULE_CHARS,
+            &truncation_notice(&rule.key),
+        );
         let block = format!("<rule>\n{content}\n</rule>");
         let joiner_cost = if blocks.is_empty() {
             0
@@ -62,6 +62,29 @@ pub(crate) fn render_rules(candidates: &[Rule]) -> RenderedBatch {
     }
 }
 
+/// Notice used when a rule's path is too long to name within the budget.
+const GENERIC_TRUNCATION_NOTICE: &str = "\n[Rule truncated; it is not injected again in this session. Read the rule file for the rest.]";
+/// Longest notice that may name a path; keeps most of the per-rule budget
+/// for rule content.
+const MAX_NOTICE_CHARS: usize = 1000;
+
+/// Appended in place of content dropped by [`truncate`]. A truncated rule is
+/// still marked injected and never re-sent, so the notice names the file the
+/// reader has to open for the rest. The path goes through the same closer
+/// neutralization as the body, and a path too long to name whole falls back
+/// to the generic notice rather than a shortened, unusable path.
+fn truncation_notice(key: &str) -> String {
+    let notice = format!(
+        "\n[Rule truncated; it is not injected again in this session. Read {} for the rest.]",
+        neutralize_rule_closer(key)
+    );
+    if notice.chars().count() > MAX_NOTICE_CHARS {
+        GENERIC_TRUNCATION_NOTICE.to_owned()
+    } else {
+        notice
+    }
+}
+
 /// Rewrite literal `</rule>` closers so a rule body cannot terminate its
 /// wrapper block early. Nothing else is escaped: rule bodies routinely contain
 /// code with `<`, `>`, and `&` that must reach the model verbatim.
@@ -69,18 +92,20 @@ fn neutralize_rule_closer(value: &str) -> String {
     value.replace("</rule>", "<\\/rule>")
 }
 
-/// Truncate `text` to at most `max_chars` characters, truncation notice
-/// included, so callers can budget on the returned length.
+/// Truncate `text` to at most `max_chars` characters, `notice` included, so
+/// callers can budget on the returned length.
 ///
-/// `max_chars` must exceed the notice length; [`MAX_RULE_CHARS`] does.
-fn truncate(text: &str, max_chars: usize) -> String {
+/// `max_chars` must exceed the notice length; [`truncation_notice`] caps it at
+/// [`MAX_NOTICE_CHARS`], well under [`MAX_RULE_CHARS`].
+fn truncate(text: &str, max_chars: usize, notice: &str) -> String {
     if text.chars().count() <= max_chars {
         return text.to_owned();
     }
 
-    let keep = max_chars.saturating_sub(TRUNCATION_NOTICE.chars().count());
-    let prefix = text.chars().take(keep).collect::<String>();
-    format!("{prefix}{TRUNCATION_NOTICE}")
+    let keep = max_chars.saturating_sub(notice.chars().count());
+    let mut kept = text.chars().take(keep).collect::<String>();
+    kept.push_str(notice);
+    kept
 }
 
 #[cfg(test)]
@@ -100,15 +125,16 @@ mod tests {
 
     #[test]
     fn truncate_keeps_short_text_unchanged() {
-        assert_eq!(truncate("short", 100), "short");
+        assert_eq!(truncate("short", 100, "!"), "short");
     }
 
     #[test]
     fn truncate_result_stays_within_the_limit() {
         let long = "a".repeat(MAX_RULE_CHARS + 1000);
-        let truncated = truncate(&long, MAX_RULE_CHARS);
+        let notice = truncation_notice("/rules/long.md");
+        let truncated = truncate(&long, MAX_RULE_CHARS, &notice);
         assert_eq!(truncated.chars().count(), MAX_RULE_CHARS);
-        assert!(truncated.ends_with(TRUNCATION_NOTICE));
+        assert!(truncated.ends_with(&notice));
     }
 
     #[test]
@@ -162,12 +188,35 @@ mod tests {
 
     #[test]
     fn render_caps_a_single_rule_at_the_per_rule_budget() {
-        let batch = render_rules(&[rule("a", "y".repeat(MAX_RULE_CHARS * 2))]);
+        let batch = render_rules(&[rule("/rules/a.md", "y".repeat(MAX_RULE_CHARS * 2))]);
         let wrapper_chars = "<rule>\n\n</rule>".chars().count();
         assert_eq!(
             batch.context.chars().count(),
             MAX_RULE_CHARS + wrapper_chars
         );
-        assert!(batch.context.contains(TRUNCATION_NOTICE));
+        assert!(batch.context.contains("Read /rules/a.md for the rest."));
+    }
+
+    #[test]
+    fn truncation_notice_neutralizes_a_closer_in_the_path() {
+        let batch = render_rules(&[rule(
+            "/tmp/</rule>/.claude/rules/long.md",
+            "y".repeat(MAX_RULE_CHARS * 2),
+        )]);
+        assert_eq!(batch.context.matches("</rule>").count(), 1);
+        assert!(batch.context.ends_with("\n</rule>"));
+    }
+
+    #[test]
+    fn oversized_path_falls_back_to_the_generic_notice_within_budget() {
+        let key = format!("/{}", "p".repeat(MAX_RULE_CHARS + 100));
+        let batch = render_rules(&[rule(&key, "y".repeat(MAX_RULE_CHARS * 2))]);
+        let wrapper_chars = "<rule>\n\n</rule>".chars().count();
+        assert_eq!(
+            batch.context.chars().count(),
+            MAX_RULE_CHARS + wrapper_chars
+        );
+        assert!(batch.context.contains(GENERIC_TRUNCATION_NOTICE));
+        assert!(!batch.context.contains(&key));
     }
 }
