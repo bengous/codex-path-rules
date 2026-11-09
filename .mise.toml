@@ -1,2 +1,1 @@
-[tools]
-rust = "1.97.1"
+include = ["git::https://github.com/bengous/stack-watch.git//toolchain/rust.toml?ref=toolchain-2026.11.09"]

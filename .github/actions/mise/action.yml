@@ -1,0 +1,24 @@
+name: mise
+description: >
+  Run right after the checkout. Installs the mise.toml tools a job runs, at
+  the versions of mise.toml's bengous/stack-watch registry include, and puts
+  them on PATH.
+
+inputs:
+  tools:
+    description: The mise.toml tools the job runs, comma-separated (MISE_ENABLE_TOOLS); mise installs no other.
+    required: true
+  github-token:
+    description: A token that reads the private bengous/stack-watch include; github.token cannot.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+      env:
+        MISE_ENABLE_TOOLS: ${{ inputs.tools }}
+        MISE_GITHUB_TOKEN: ${{ inputs.github-token }}
+      with:
+        version: 2026.11.2
+        add_shims_to_path: false
